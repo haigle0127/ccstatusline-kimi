@@ -1,0 +1,99 @@
+{
+  "name": "ccstatusline-kimi",
+  "displayName": "ccstatusline-kimi",
+  "description": "在 VSCode 底部状态栏显示 Claude Code + Kimi 实时状态：模型、Token、Git、费用等",
+  "version": "0.1.0",
+  "publisher": "haigle",
+  "author": "haigle",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/haigle0127/ccstatusline-kimi"
+  },
+  "engines": {
+    "vscode": "^1.80.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "keywords": [
+    "claude",
+    "claude-code",
+    "status-line",
+    "status-bar"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "configuration": {
+      "title": "Claude Code Status Line",
+      "properties": {
+        "ccstatusline.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "是否启用 Claude Code 状态栏显示"
+        },
+        "ccstatusline.refreshInterval": {
+          "type": "number",
+          "default": 2000,
+          "minimum": 500,
+          "maximum": 60000,
+          "description": "状态栏刷新间隔（毫秒）"
+        },
+        "ccstatusline.format": {
+          "type": "string",
+          "default": "$(comment-discussion) {model} | {git-branch} | {tokens-input} {tokens-output} | {cost} | 已用{context-length}",
+          "description": "状态栏显示格式。可用占位符：{model}, {git-branch}, {git-status}, {tokens-input}, {tokens-output}, {tokens-total}, {cost}, {duration}, {context-pct}, {context-length}, {session-name}"
+        },
+        "ccstatusline.statusFilePath": {
+          "type": "string",
+          "default": "",
+          "description": "Claude Code 状态文件路径。留空则使用默认路径 ~/.ccstatusline/vscode-status.json"
+        },
+        "ccstatusline.showWhenIdle": {
+          "type": "boolean",
+          "default": true,
+          "description": "没有活跃 Claude 会话时是否仍显示状态栏（显示最后已知状态）"
+        },
+        "ccstatusline.hideAfterMs": {
+          "type": "number",
+          "default": 0,
+          "description": "Claude Code 多久无更新后隐藏状态栏（毫秒，0 表示不隐藏）"
+        }
+      }
+    },
+    "commands": [
+      {
+        "command": "ccstatusline.refresh",
+        "title": "刷新 Claude Code 状态栏",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "ccstatusline.openSettings",
+        "title": "打开 Claude Code 状态栏设置",
+        "icon": "$(gear)"
+      },
+      {
+        "command": "ccstatusline.copyStatusJson",
+        "title": "复制当前状态 JSON 到剪贴板"
+      }
+    ]
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "lint": "eslint src --ext ts",
+    "package": "vsce package"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.80.0",
+    "@typescript-eslint/eslint-plugin": "^7.0.0",
+    "@typescript-eslint/parser": "^7.0.0",
+    "eslint": "^8.57.0",
+    "typescript": "^5.4.0"
+  }
+}

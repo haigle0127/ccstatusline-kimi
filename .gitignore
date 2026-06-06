@@ -1,0 +1,35 @@
+# Dependencies
+node_modules/
+
+# Build output
+out/
+dist/
+*.vsix
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+
+# IDE / Editor
+.vscode/
+.vscode-test/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Claude Code local project settings (may contain sensitive paths/permissions)
+.claude/
+
+# Temporary directories
+tmps/
+tmp/
+temp/
+
+# Lock file (optional: keep package-lock.json if you want reproducible installs)
+# package-lock.json
