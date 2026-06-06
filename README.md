@@ -1,11 +1,16 @@
-# ccstatusline-kimi
+<p align="center">
+  <img src="icon.png" width="128" alt="ccstatusline-kimi icon">
+</p>
 
-在 VSCode 底部状态栏显示 Claude Code + Kimi 实时状态：模型、Git 分支、Token、费用、上下文等。
+<h1 align="center">ccstatusline-kimi</h1>
 
-> 专为 **Claude Code for VSCode + CcSwitch/Kimi** 设计。
->
-> 开发者：haigle  
-> GitHub：[https://github.com/haigle0127/ccstatusline-kimi](https://github.com/haigle0127/ccstatusline-kimi)
+<p align="center">在 VSCode 底部状态栏显示 Claude Code + Kimi 实时状态：模型、Git 分支、Token、费用、上下文等。</p>
+
+<p align="center">
+  专为 <strong>Claude Code for VSCode + CcSwitch/Kimi</strong> 设计<br>
+  开发者：haigle<br>
+  GitHub：<a href="https://github.com/haigle0127/ccstatusline-kimi">https://github.com/haigle0127/ccstatusline-kimi</a>
+</p>
 
 ## 数据来源
 
