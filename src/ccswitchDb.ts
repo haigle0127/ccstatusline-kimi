@@ -1,9 +1,10 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
-import initSqlJs from 'sql.js';
 
-const CCSWITCH_DB = path.join(os.homedir(), '.cc-switch', 'cc-switch.db');
+const CLAUDE_DIR = path.join(os.homedir(), '.claude');
+const PROJECTS_DIR = path.join(CLAUDE_DIR, 'projects');
+const TRANSCRIPTS_DIR = path.join(CLAUDE_DIR, 'transcripts');
 
 export interface UsageSummary {
     totalRequests: number;
@@ -28,105 +29,257 @@ export interface DailyStats {
     cacheReadTokens: number;
 }
 
-let sqlModule: Awaited<ReturnType<typeof initSqlJs>> | null = null;
-
-async function getSql(): Promise<NonNullable<typeof sqlModule>> {
-    if (sqlModule) return sqlModule;
-    sqlModule = await initSqlJs();
-    return sqlModule;
+interface RawEntry {
+    timestamp?: string;
+    type?: string;
+    message?: {
+        usage?: {
+            input_tokens?: number;
+            output_tokens?: number;
+            cache_read_input_tokens?: number;
+            cache_creation_input_tokens?: number;
+        };
+    };
 }
 
-function openDb() {
-    if (!fs.existsSync(CCSWITCH_DB)) {
-        throw new Error('cc-switch 数据库不存在: ' + CCSWITCH_DB);
+// Rough cost rates per MTok (Claude Sonnet 4.6)
+const INPUT_RATE = 3;
+const OUTPUT_RATE = 15;
+const CACHE_READ_RATE = 0.3; // 10% of input
+const CACHE_CREATION_RATE = 3.75; // 125% of input
+
+function parseJsonlLine(line: string): RawEntry | null {
+    try {
+        const parsed = JSON.parse(line);
+        if (parsed && typeof parsed === 'object') {
+            return parsed as RawEntry;
+        }
+    } catch {
+        // ignore malformed lines
     }
-    const buf = fs.readFileSync(CCSWITCH_DB);
-    return buf;
+    return null;
 }
 
-/**
- * fresh_input SQL 表达式
- * 对于 codex/gemini，input_tokens 包含了 cache_read_tokens，需要扣除
- */
-function freshInputSql(alias: string = ''): string {
-    const p = alias ? `${alias}.` : '';
-    return `CASE WHEN ${p}app_type IN ('codex', 'gemini') AND ${p}input_tokens >= ${p}cache_read_tokens THEN (${p}input_tokens - ${p}cache_read_tokens) ELSE ${p}input_tokens END`;
+function getLocalDateString(isoTimestamp: string): string {
+    const d = new Date(isoTimestamp);
+    const year = d.getFullYear();
+    const month = (d.getMonth() + 1).toString().padStart(2, '0');
+    const day = d.getDate().toString().padStart(2, '0');
+    return `${year}-${month}-${day}`;
+}
+
+function estimateCost(
+    input: number,
+    output: number,
+    cacheRead: number,
+    cacheCreation: number
+): number {
+    const inputCost = (input / 1_000_000) * INPUT_RATE;
+    const outputCost = (output / 1_000_000) * OUTPUT_RATE;
+    const cacheReadCost = (cacheRead / 1_000_000) * CACHE_READ_RATE;
+    const cacheCreationCost = (cacheCreation / 1_000_000) * CACHE_CREATION_RATE;
+    return inputCost + outputCost + cacheReadCost + cacheCreationCost;
+}
+
+function collectTranscriptFiles(): string[] {
+    const files: string[] = [];
+
+    // VSCode extension layout: ~/.claude/projects/<project>/<sessionId>.jsonl
+    if (fs.existsSync(PROJECTS_DIR)) {
+        try {
+            const projects = fs.readdirSync(PROJECTS_DIR, { withFileTypes: true })
+                .filter(d => d.isDirectory())
+                .map(d => path.join(PROJECTS_DIR, d.name));
+            for (const projectDir of projects) {
+                try {
+                    const entries = fs.readdirSync(projectDir, { withFileTypes: true });
+                    for (const entry of entries) {
+                        if (entry.isFile() && entry.name.endsWith('.jsonl')) {
+                            files.push(path.join(projectDir, entry.name));
+                        } else if (entry.isDirectory()) {
+                            // Handle nested dirs (e.g. subagents)
+                            const subDir = path.join(projectDir, entry.name);
+                            try {
+                                const subFiles = fs.readdirSync(subDir)
+                                    .filter(f => f.endsWith('.jsonl'))
+                                    .map(f => path.join(subDir, f));
+                                files.push(...subFiles);
+                            } catch { /* ignore */ }
+                        }
+                    }
+                } catch { /* ignore unreadable dirs */ }
+            }
+        } catch { /* ignore */ }
+    }
+
+    // Legacy CLI layout: ~/.claude/transcripts/<sessionId>.jsonl
+    if (fs.existsSync(TRANSCRIPTS_DIR)) {
+        try {
+            const entries = fs.readdirSync(TRANSCRIPTS_DIR, { withFileTypes: true });
+            for (const entry of entries) {
+                if (entry.isFile() && entry.name.endsWith('.jsonl')) {
+                    files.push(path.join(TRANSCRIPTS_DIR, entry.name));
+                }
+            }
+        } catch { /* ignore */ }
+    }
+
+    return files;
+}
+
+function readTranscriptData(
+    filePath: string,
+    startDate?: Date,
+    endDate?: Date
+): Array<{
+    date: string;
+    inputTokens: number;
+    outputTokens: number;
+    cacheReadTokens: number;
+    cacheCreationTokens: number;
+    requestCount: number;
+}> {
+    const result: ReturnType<typeof readTranscriptData> = [];
+
+    const startTs = startDate ? startDate.getTime() : 0;
+    const endTs = endDate ? endDate.getTime() : Infinity;
+
+    try {
+        const data = fs.readFileSync(filePath, 'utf-8');
+        const lines = data.split(/\r?\n/).filter(l => l.trim() !== '');
+
+        for (const line of lines) {
+            const entry = parseJsonlLine(line);
+            if (!entry || entry.type !== 'assistant') {
+                continue;
+            }
+            const usage = entry.message?.usage;
+            if (!usage) {
+                continue;
+            }
+
+            const timestamp = entry.timestamp;
+            if (!timestamp) {
+                continue;
+            }
+
+            const entryTime = new Date(timestamp).getTime();
+            if (Number.isNaN(entryTime) || entryTime < startTs || entryTime > endTs) {
+                continue;
+            }
+
+            const date = getLocalDateString(timestamp);
+            const inputTokens = usage.input_tokens || 0;
+            const outputTokens = usage.output_tokens || 0;
+            const cacheReadTokens = usage.cache_read_input_tokens || 0;
+            const cacheCreationTokens = usage.cache_creation_input_tokens || 0;
+
+            // Check if this is a "real" request (has output tokens)
+            if (outputTokens === 0 && inputTokens === 0) {
+                continue;
+            }
+
+            result.push({
+                date,
+                inputTokens,
+                outputTokens,
+                cacheReadTokens,
+                cacheCreationTokens,
+                requestCount: 1,
+            });
+        }
+    } catch {
+        // ignore unreadable files
+    }
+
+    return result;
+}
+
+function aggregateByDate(
+    entries: Array<{
+        date: string;
+        inputTokens: number;
+        outputTokens: number;
+        cacheReadTokens: number;
+        cacheCreationTokens: number;
+        requestCount: number;
+    }>
+): Map<string, DailyStats> {
+    const map = new Map<string, DailyStats>();
+
+    for (const e of entries) {
+        const existing = map.get(e.date);
+        if (existing) {
+            existing.requestCount += e.requestCount;
+            existing.inputTokens += e.inputTokens;
+            existing.outputTokens += e.outputTokens;
+            existing.cacheCreationTokens += e.cacheCreationTokens;
+            existing.cacheReadTokens += e.cacheReadTokens;
+        } else {
+            map.set(e.date, {
+                date: e.date,
+                requestCount: e.requestCount,
+                inputTokens: e.inputTokens,
+                outputTokens: e.outputTokens,
+                cacheCreationTokens: e.cacheCreationTokens,
+                cacheReadTokens: e.cacheReadTokens,
+                totalTokens: 0,
+                totalCost: 0,
+            });
+        }
+    }
+
+    // Compute derived fields
+    for (const stats of map.values()) {
+        stats.totalTokens = stats.inputTokens + stats.outputTokens + stats.cacheCreationTokens + stats.cacheReadTokens;
+        stats.totalCost = estimateCost(
+            stats.inputTokens,
+            stats.outputTokens,
+            stats.cacheReadTokens,
+            stats.cacheCreationTokens
+        );
+    }
+
+    return map;
+}
+
+function getAllEntries(startDate?: Date, endDate?: Date): ReturnType<typeof readTranscriptData> {
+    const files = collectTranscriptFiles();
+    const allEntries: ReturnType<typeof readTranscriptData> = [];
+
+    for (const file of files) {
+        const entries = readTranscriptData(file, startDate, endDate);
+        allEntries.push(...entries);
+    }
+
+    return allEntries;
 }
 
 export async function getUsageSummary(
     startDate?: Date,
     endDate?: Date,
-    appType?: string
+    _appType?: string
 ): Promise<UsageSummary> {
-    const SQL = await getSql();
-    const buf = openDb();
-    const db = new SQL.Database(buf);
+    const entries = getAllEntries(startDate, endDate);
 
-    const startTs = startDate ? Math.floor(startDate.getTime() / 1000) : undefined;
-    const endTs = endDate ? Math.floor(endDate.getTime() / 1000) : undefined;
+    let totalRequests = 0;
+    let totalInputTokens = 0;
+    let totalOutputTokens = 0;
+    let totalCacheCreationTokens = 0;
+    let totalCacheReadTokens = 0;
 
-    const conditions: string[] = [];
-    const params: (string | number)[] = [];
-
-    if (startTs !== undefined) {
-        conditions.push('created_at >= ?');
-        params.push(startTs);
+    for (const e of entries) {
+        totalRequests += e.requestCount;
+        totalInputTokens += e.inputTokens;
+        totalOutputTokens += e.outputTokens;
+        totalCacheCreationTokens += e.cacheCreationTokens;
+        totalCacheReadTokens += e.cacheReadTokens;
     }
-    if (endTs !== undefined) {
-        conditions.push('created_at <= ?');
-        params.push(endTs);
-    }
-    if (appType) {
-        conditions.push("app_type = ?");
-        params.push(appType);
-    }
-
-    const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
-    const freshInput = freshInputSql();
-
-    const sql = `
-        SELECT
-            COUNT(*) as total_requests,
-            COALESCE(SUM(CAST(total_cost_usd AS REAL)), 0) as total_cost,
-            COALESCE(SUM(${freshInput}), 0) as total_input_tokens,
-            COALESCE(SUM(output_tokens), 0) as total_output_tokens,
-            COALESCE(SUM(cache_creation_tokens), 0) as total_cache_creation_tokens,
-            COALESCE(SUM(cache_read_tokens), 0) as total_cache_read_tokens,
-            COALESCE(SUM(CASE WHEN status_code >= 200 AND status_code < 300 THEN 1 ELSE 0 END), 0) as success_count
-        FROM proxy_request_logs
-        ${where}
-    `;
-
-    const res = db.exec(sql, params);
-    db.close();
-
-    if (!res.length || !res[0].values.length) {
-        return {
-            totalRequests: 0,
-            totalCost: 0,
-            totalInputTokens: 0,
-            totalOutputTokens: 0,
-            totalCacheCreationTokens: 0,
-            totalCacheReadTokens: 0,
-            realTotalTokens: 0,
-            cacheHitRate: 0,
-            successRate: 0,
-        };
-    }
-
-    const row = res[0].values[0];
-    const totalRequests = Number(row[0]);
-    const totalCost = Number(row[1]);
-    const totalInputTokens = Number(row[2]);
-    const totalOutputTokens = Number(row[3]);
-    const totalCacheCreationTokens = Number(row[4]);
-    const totalCacheReadTokens = Number(row[5]);
-    const successCount = Number(row[6]);
 
     const realTotalTokens = totalInputTokens + totalOutputTokens + totalCacheCreationTokens + totalCacheReadTokens;
     const cacheableInput = totalInputTokens + totalCacheCreationTokens + totalCacheReadTokens;
     const cacheHitRate = cacheableInput > 0 ? totalCacheReadTokens / cacheableInput : 0;
-    const successRate = totalRequests > 0 ? (successCount / totalRequests) * 100 : 0;
+    const totalCost = estimateCost(totalInputTokens, totalOutputTokens, totalCacheReadTokens, totalCacheCreationTokens);
 
     return {
         totalRequests,
@@ -137,62 +290,18 @@ export async function getUsageSummary(
         totalCacheReadTokens,
         realTotalTokens,
         cacheHitRate,
-        successRate,
+        successRate: 100, // transcript only contains successful requests
     };
 }
 
 export async function getDailyTrends(
     startDate?: Date,
     endDate?: Date,
-    appType?: string
+    _appType?: string
 ): Promise<DailyStats[]> {
-    const SQL = await getSql();
-    const buf = openDb();
-    const db = new SQL.Database(buf);
+    const entries = getAllEntries(startDate, endDate);
+    const map = aggregateByDate(entries);
 
-    const startTs = startDate ? Math.floor(startDate.getTime() / 1000) : undefined;
-    const endTs = endDate ? Math.floor(endDate.getTime() / 1000) : undefined;
-
-    const conditions: string[] = ['created_at >= ?', 'created_at <= ?'];
-    const params: (string | number)[] = [startTs ?? 0, endTs ?? Math.floor(Date.now() / 1000)];
-
-    if (appType) {
-        conditions.push('app_type = ?');
-        params.push(appType);
-    }
-
-    const where = `WHERE ${conditions.join(' AND ')}`;
-    const freshInput = freshInputSql();
-
-    const sql = `
-        SELECT
-            date(created_at, 'unixepoch', 'localtime') as day,
-            COUNT(*) as request_count,
-            COALESCE(SUM(CAST(total_cost_usd AS REAL)), 0) as total_cost,
-            COALESCE(SUM(${freshInput} + output_tokens), 0) as total_tokens,
-            COALESCE(SUM(${freshInput}), 0) as input_tokens,
-            COALESCE(SUM(output_tokens), 0) as output_tokens,
-            COALESCE(SUM(cache_creation_tokens), 0) as cache_creation_tokens,
-            COALESCE(SUM(cache_read_tokens), 0) as cache_read_tokens
-        FROM proxy_request_logs
-        ${where}
-        GROUP BY day
-        ORDER BY day ASC
-    `;
-
-    const res = db.exec(sql, params);
-    db.close();
-
-    if (!res.length) return [];
-
-    return res[0].values.map(row => ({
-        date: String(row[0]),
-        requestCount: Number(row[1]),
-        totalCost: Number(row[2]),
-        totalTokens: Number(row[3]),
-        inputTokens: Number(row[4]),
-        outputTokens: Number(row[5]),
-        cacheCreationTokens: Number(row[6]),
-        cacheReadTokens: Number(row[7]),
-    }));
+    const sorted = Array.from(map.values()).sort((a, b) => a.date.localeCompare(b.date));
+    return sorted;
 }

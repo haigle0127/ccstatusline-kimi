@@ -2,7 +2,7 @@
   "name": "ccstatusline-kimi",
   "displayName": "ccstatusline-kimi",
   "description": "在 VSCode 底部状态栏显示 Claude Code + Kimi 实时状态：模型、Token、Git、费用等",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "publisher": "haigle",
   "author": "haigle",
   "license": "MIT",
