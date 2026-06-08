@@ -30,7 +30,7 @@ export class StatusBarManager {
             1000 // priority: higher appears further right
         );
         this.config = getConfig();
-        this.item.command = 'ccstatusline.openSettings';
+        this.item.command = 'ccstatusline.showHistory';
         this.item.show();
 
         this.disposables.push(this.item);
@@ -200,11 +200,19 @@ export class StatusBarManager {
             const rendered = renderFormat(this.config.format, ctx);
 
             this.item.text = rendered.text || '$(comment-discussion) Claude';
-            this.item.tooltip = rendered.tooltip;
+            const tooltip = new vscode.MarkdownString();
+            tooltip.appendMarkdown(rendered.tooltip.replace(/\n/g, '\n\n'));
+            tooltip.appendMarkdown('\n\n---\n\n[$(gear) 打开设置](command:ccstatusline.openSettings)');
+            tooltip.isTrusted = true;
+            this.item.tooltip = tooltip;
             this.item.color = undefined;
         } catch (error) {
             this.item.text = '$(claude) ...';
-            this.item.tooltip = `状态更新失败: ${error instanceof Error ? error.message : String(error)}`;
+            const tooltip = new vscode.MarkdownString();
+            tooltip.appendMarkdown(`状态更新失败: ${error instanceof Error ? error.message : String(error)}`);
+            tooltip.appendMarkdown('\n\n---\n\n[$(gear) 打开设置](command:ccstatusline.openSettings)');
+            tooltip.isTrusted = true;
+            this.item.tooltip = tooltip;
         }
     }
 

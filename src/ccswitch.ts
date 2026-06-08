@@ -171,27 +171,3 @@ export function getCurrentProvider(appType: 'claude' | 'claude-desktop' = 'claud
     return parseProviderRow(rows[0].join('|'));
 }
 
-export function getCurrentModelFromProvider(provider?: CcSwitchProvider | null): string | null {
-    if (!provider) {
-        return null;
-    }
-
-    const env = provider.settingsConfig?.env ?? {};
-
-    // Explicit model override in provider config
-    if (env.ANTHROPIC_MODEL) {
-        return env.ANTHROPIC_MODEL;
-    }
-
-    // Fallback: check default mappings based on Claude's model family
-    // This requires reading Claude's settings.json which we do separately
-    return null;
-}
-
-export function getProviderCostMultiplier(provider?: CcSwitchProvider | null): number {
-    if (!provider) {
-        return 1.0;
-    }
-    const parsed = parseFloat(provider.costMultiplier);
-    return Number.isFinite(parsed) ? parsed : 1.0;
-}

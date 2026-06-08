@@ -2,7 +2,7 @@
   "name": "ccstatusline-kimi",
   "displayName": "ccstatusline-kimi",
   "description": "在 VSCode 底部状态栏显示 Claude Code + Kimi 实时状态：模型、Token、Git、费用等",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "publisher": "haigle",
   "author": "haigle",
   "license": "MIT",
@@ -72,6 +72,11 @@
         "icon": "$(refresh)"
       },
       {
+        "command": "ccstatusline.showHistory",
+        "title": "查看 Claude Code 历史用量",
+        "icon": "$(graph)"
+      },
+      {
         "command": "ccstatusline.openSettings",
         "title": "打开 Claude Code 状态栏设置",
         "icon": "$(gear)"
@@ -96,5 +101,8 @@
     "@typescript-eslint/parser": "^7.0.0",
     "eslint": "^8.57.0",
     "typescript": "^5.4.0"
+  },
+  "dependencies": {
+    "sql.js": "^1.12.0"
   }
 }
