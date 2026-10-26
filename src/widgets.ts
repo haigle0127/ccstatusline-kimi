@@ -13,17 +13,22 @@ function resolveClaudeModelName(settings: ClaudeSettings | null): string {
 }
 
 function resolveModelName(ctx: RenderContext): string {
-    const provider = ctx.state.provider;
-    if (provider) {
-        const envModel = provider.settingsConfig?.env?.ANTHROPIC_MODEL;
-        if (envModel) {
-            return envModel;
-        }
-        // Provider is active but didn't specify a concrete model.
-        // Don't guess "Sonnet" — just show the provider name.
-        return provider.name;
+    // The latest main-chain response is the actual routed model. Provider and
+    // Claude settings only describe the next request until a response arrives.
+    const recordedModel = ctx.state.tokenMetrics.model?.trim();
+    if (recordedModel) {
+        return recordedModel;
     }
-    return resolveClaudeModelName(ctx.state.settings);
+
+    const provider = ctx.state.provider;
+    const envModel = provider?.settingsConfig?.env?.ANTHROPIC_MODEL?.trim();
+    if (envModel) {
+        return envModel;
+    }
+    if (ctx.state.settings?.model) {
+        return resolveClaudeModelName(ctx.state.settings);
+    }
+    return provider?.name ?? resolveClaudeModelName(ctx.state.settings);
 }
 
 function formatTokens(n: number): string {
@@ -46,23 +51,14 @@ function formatCost(usd: number): string {
     return `$${usd.toFixed(4)}`;
 }
 
-function formatDuration(ms: number): string {
-    const totalSeconds = Math.floor(ms / 1000);
-    const minutes = Math.floor(totalSeconds / 60);
-    const seconds = totalSeconds % 60;
-    if (minutes > 0) {
-        return `${minutes}m${seconds.toString().padStart(2, '0')}s`;
-    }
-    return `${seconds}s`;
-}
-
 export const WIDGETS: Record<string, (ctx: RenderContext) => WidgetResult | null> = {
     model(ctx) {
         const name = resolveModelName(ctx);
         const provider = ctx.state.provider;
+        const source = ctx.state.tokenMetrics.model ? '最近一次主链响应' : '当前供应商／Claude 配置';
         const tooltip = provider
-            ? `模型: ${name}\n供应商: ${provider.name}`
-            : `Claude 模型: ${name}`;
+            ? `模型: ${name}\n来源: ${source}\n供应商: ${provider.name}`
+            : `Claude 模型: ${name}\n来源: ${source}`;
         return { text: name, tooltip };
     },
 
@@ -123,49 +119,22 @@ export const WIDGETS: Record<string, (ctx: RenderContext) => WidgetResult | null
     },
 
     cost(ctx) {
-        const provider = ctx.state.provider;
-        const providerName = provider?.name.toLowerCase() ?? '';
-        const envModel = provider?.settingsConfig?.env?.ANTHROPIC_MODEL?.toLowerCase() ??
-            (ctx.state.settings?.model ?? 'sonnet').toLowerCase();
-
-        // Rough estimates per MTok. For third-party providers these are just
-        // Claude-family proxies; real pricing may differ.
-        let inputRate = 3;
-        let outputRate = 15;
-        let rateLabel = envModel;
-
-        if (envModel.includes('opus')) {
-            inputRate = 15;
-            outputRate = 75;
-        } else if (envModel.includes('haiku')) {
-            inputRate = 0.8;
-            outputRate = 4;
-        } else if (envModel.includes('deepseek') || providerName.includes('deepseek')) {
-            inputRate = 0.5;
-            outputRate = 2;
-            rateLabel = 'deepseek';
-        } else if (envModel.includes('kimi') || providerName.includes('kimi')) {
-            inputRate = 2;
-            outputRate = 8;
-            rateLabel = 'kimi';
+        const { totalCost, unpricedRequests, pricedRequests, multiplier } = ctx.state.sessionCost;
+        if (ctx.state.tokenMetrics.totalTokens === 0) {
+            return { text: '$0.000', tooltip: '当前会话还没有 Token 用量' };
+        }
+        if (totalCost === null) {
+            return {
+                text: '—',
+                tooltip: '会话费用未定价\n请在 CC Switch 的模型定价中补充当前模型价格'
+            };
         }
 
-        const multiplier = provider ? parseFloat(provider.costMultiplier) : 1.0;
-        const m = Number.isFinite(multiplier) ? multiplier : 1.0;
-
-        const inputCost = (ctx.state.tokenMetrics.inputTokens / 1_000_000) * inputRate * m;
-        const outputCost = (ctx.state.tokenMetrics.outputTokens / 1_000_000) * outputRate * m;
-        const cachedCost = (ctx.state.tokenMetrics.cachedTokens / 1_000_000) * (inputRate * 0.1) * m;
-        const total = inputCost + outputCost + cachedCost;
-
-        if (total < 0.0001) {
-            return { text: '$0.000', tooltip: '预估会话费用' };
-        }
-
-        const providerNote = provider ? `\n供应商: ${provider.name}` : '';
+        const partial = unpricedRequests > 0 ? `\n${unpricedRequests} 条请求缺少定价，金额仅包含已定价部分` : '';
+        const providerNote = ctx.state.provider ? `\n供应商: ${ctx.state.provider.name}` : '';
         return {
-            text: formatCost(total),
-            tooltip: `预估会话费用 (按 ${rateLabel} 费率估算)${providerNote}`
+            text: `${formatCost(totalCost)}${unpricedRequests > 0 ? '*' : ''}`,
+            tooltip: `预估会话费用（按 CC Switch 模型定价，非供应商账单）\n已计价请求: ${pricedRequests}\n成本倍率: ${multiplier}${providerNote}${partial}`
         };
     },
 
@@ -179,22 +148,30 @@ export const WIDGETS: Record<string, (ctx: RenderContext) => WidgetResult | null
 
     'context-length'(ctx) {
         const n = ctx.state.tokenMetrics.contextLength;
-        return { text: formatTokens(n), tooltip: `上下文长度: ${n.toLocaleString()}` };
+        const model = ctx.state.tokenMetrics.model;
+        return {
+            text: formatTokens(n),
+            tooltip: `最近请求上下文估算: ${n.toLocaleString()} tokens（含本轮输出）${model ? `\n记录模型: ${model}` : ''}`
+        };
     },
 
     'context-pct'(ctx) {
-        // Estimate context window based on model
-        const model = (ctx.state.settings?.model ?? 'sonnet').toLowerCase();
-        let windowSize = 200_000;
-        if (model.includes('1m') || model.includes('1000000')) {
+        const env = ctx.state.provider?.settingsConfig?.env ?? {};
+        const configuredWindow = Number(env.CLAUDE_CODE_MAX_CONTEXT_TOKENS ?? env.CLAUDE_CODE_AUTO_COMPACT_WINDOW);
+        const model = (ctx.state.tokenMetrics.model ?? env.ANTHROPIC_MODEL ?? ctx.state.settings?.model ?? '').toLowerCase();
+        let windowSize = Number.isFinite(configuredWindow) && configuredWindow > 0 ? configuredWindow : 200_000;
+        if (!configuredWindow && (model.includes('1m') || model.includes('1000000'))) {
             windowSize = 1_000_000;
-        } else if (model.includes('200k') || model.includes('200000')) {
-            windowSize = 200_000;
+        } else if (!configuredWindow && model.includes('256k')) {
+            windowSize = 256_000;
         }
 
         const used = ctx.state.tokenMetrics.contextLength;
         const pct = windowSize > 0 ? Math.round((used / windowSize) * 100) : 0;
-        return { text: `${pct}`, tooltip: `上下文使用: ${used.toLocaleString()} / ${windowSize.toLocaleString()} (${pct}%)` };
+        return {
+            text: `${pct}%`,
+            tooltip: `上下文使用估算: ${used.toLocaleString()} / ${windowSize.toLocaleString()} (${pct}%)${configuredWindow ? '\n窗口来自 CC Switch 供应商配置' : '\n窗口按模型默认值估算'}`
+        };
     },
 
     'session-id'(ctx) {

@@ -1,18 +1,13 @@
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
 import * as vscode from 'vscode';
-import { collectClaudeState } from './claude';
+import { collectClaudeState, getClaudeConfigDir } from './claude';
+import { CCSWITCH_DB_PATH, CCSWITCH_SETTINGS_PATH } from './sqlite';
 import { getGitInfo } from './git';
 import { getConfig, onConfigChange, type CcstatuslineConfig } from './config';
 import { renderFormat } from './widgets';
 import type { ClaudeState, RenderContext } from './types';
 
-const CLAUDE_DIR = path.join(os.homedir(), '.claude');
-const SESSIONS_DIR = path.join(CLAUDE_DIR, 'sessions');
-const PROJECTS_DIR = path.join(CLAUDE_DIR, 'projects');
-const SETTINGS_PATH = path.join(CLAUDE_DIR, 'settings.json');
-const CCSWITCH_DB = path.join(os.homedir(), '.cc-switch', 'cc-switch.db');
 
 export class StatusBarManager {
     private item: vscode.StatusBarItem;
@@ -23,6 +18,7 @@ export class StatusBarManager {
     private disposables: vscode.Disposable[] = [];
     private lastState: ClaudeState | null = null;
     private lastTranscriptPath: string | null = null;
+    private refreshVersion = 0;
 
     constructor() {
         this.item = vscode.window.createStatusBarItem(
@@ -107,43 +103,40 @@ export class StatusBarManager {
             try { w.close(); } catch { /* ignore */ }
         }
         this.watchers = [];
+        this.lastTranscriptPath = null;
 
         if (!this.config.enabled) {
             return;
         }
 
+        const claudeDir = getClaudeConfigDir();
+
         // Watch sessions directory for new/removed active sessions
-        this.watchPath(SESSIONS_DIR, false);
+        this.watchPath(path.join(claudeDir, 'sessions'), false);
 
         // Watch projects directory for new transcripts
-        this.watchPath(PROJECTS_DIR, true);
+        this.watchPath(path.join(claudeDir, 'projects'), true);
 
         // Watch Claude settings for model changes
-        this.watchPath(SETTINGS_PATH, false);
+        this.watchPath(path.join(claudeDir, 'settings.json'), false);
 
-        // Watch cc-switch database for provider changes
-        this.watchPath(CCSWITCH_DB, false);
+        // Watch cc-switch database and settings for provider/directory changes
+        this.watchPath(CCSWITCH_DB_PATH, false);
+        this.watchPath(CCSWITCH_SETTINGS_PATH, false);
 
         // Also watch the currently active transcript if known
         this.updateTranscriptWatcher();
     }
 
     private updateTranscriptWatcher(): void {
-        const workspaceFolder = this.getWorkspaceFolder();
-        const state = this.lastState ?? collectClaudeState(workspaceFolder);
-        const session = state.session;
-        if (!session) {
+        const transcriptPath = this.lastState?.transcriptPath;
+        if (!transcriptPath) {
             return;
         }
 
-        // Reconstruct the likely transcript path
-        const projectDirName = session.cwd.replace(/[:\\/]/g, '-');
-        const projectDir = path.join(PROJECTS_DIR, projectDirName);
-        const directPath = path.join(projectDir, `${session.sessionId}.jsonl`);
-
-        if (fs.existsSync(directPath) && directPath !== this.lastTranscriptPath) {
-            this.lastTranscriptPath = directPath;
-            this.watchPath(directPath, false);
+        if (fs.existsSync(transcriptPath) && transcriptPath !== this.lastTranscriptPath) {
+            this.lastTranscriptPath = transcriptPath;
+            this.watchPath(transcriptPath, false);
         }
     }
 
@@ -163,6 +156,7 @@ export class StatusBarManager {
     }
 
     async refresh(): Promise<void> {
+        const version = ++this.refreshVersion;
         if (!this.config.enabled) {
             this.item.hide();
             return;
@@ -172,10 +166,13 @@ export class StatusBarManager {
 
         try {
             const [state, gitInfo] = await Promise.all([
-                Promise.resolve(collectClaudeState(workspaceFolder)),
+                collectClaudeState(workspaceFolder),
                 getGitInfo(workspaceFolder)
             ]);
 
+            if (version !== this.refreshVersion) {
+                return;
+            }
             state.gitInfo = gitInfo;
             this.lastState = state;
 
@@ -188,8 +185,8 @@ export class StatusBarManager {
                 return;
             }
 
-            if (this.config.hideAfterMs > 0 &&
-                Date.now() - state.updatedAt > this.config.hideAfterMs) {
+            if (this.config.hideAfterMs > 0 && state.activityAt > 0 &&
+                Date.now() - state.activityAt > this.config.hideAfterMs) {
                 this.item.hide();
                 return;
             }

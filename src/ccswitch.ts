@@ -1,26 +1,16 @@
 import * as fs from 'fs';
-import * as os from 'os';
-import * as path from 'path';
+import type { CcSwitchProvider } from './types';
+import { CCSWITCH_SETTINGS_PATH, numberValue, queryCcSwitch, stringValue } from './sqlite';
 
-const CCSWITCH_DIR = path.join(os.homedir(), '.cc-switch');
-const CCSWITCH_SETTINGS_PATH = path.join(CCSWITCH_DIR, 'settings.json');
-const CCSWITCH_DB_PATH = path.join(CCSWITCH_DIR, 'cc-switch.db');
-
-export interface CcSwitchProvider {
-    id: string;
-    appType: string;
-    name: string;
-    settingsConfig: {
-        env?: Record<string, string>;
-        theme?: string;
+export interface CcSwitchSettings {
+    currentProviderClaude?: string;
+    currentProviderClaudeDesktop?: string;
+    claudeConfigDir?: string;
+    usageDisplay?: {
+        currency?: string;
+        exchangeRates?: Record<string, number>;
+        trendChartType?: 'bar' | 'area';
     };
-    category?: string;
-    icon?: string;
-    iconColor?: string;
-    meta?: Record<string, unknown>;
-    isCurrent: boolean;
-    costMultiplier: string;
-    providerType?: string;
 }
 
 function parseJson(data: string): unknown {
@@ -31,143 +21,80 @@ function parseJson(data: string): unknown {
     }
 }
 
-function readJsonFile<T>(filePath: string): T | null {
+export function readCcSwitchSettings(): CcSwitchSettings | null {
     try {
-        if (!fs.existsSync(filePath)) {
+        const parsed = parseJson(fs.readFileSync(CCSWITCH_SETTINGS_PATH, 'utf8'));
+        return parsed && typeof parsed === 'object' ? parsed as CcSwitchSettings : null;
+    } catch {
+        return null;
+    }
+}
+
+// Status JSON and webview messages never need API keys or auth tokens.
+const SAFE_ENV_KEYS = new Set([
+    'ANTHROPIC_BASE_URL',
+    'ANTHROPIC_MODEL',
+    'ANTHROPIC_DEFAULT_HAIKU_MODEL',
+    'ANTHROPIC_DEFAULT_SONNET_MODEL',
+    'ANTHROPIC_DEFAULT_OPUS_MODEL',
+    'ANTHROPIC_DEFAULT_FABLE_MODEL',
+    'ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME',
+    'ANTHROPIC_DEFAULT_SONNET_MODEL_NAME',
+    'ANTHROPIC_DEFAULT_OPUS_MODEL_NAME',
+    'ANTHROPIC_DEFAULT_FABLE_MODEL_NAME',
+    'CLAUDE_CODE_SUBAGENT_MODEL',
+    'CLAUDE_CODE_MAX_CONTEXT_TOKENS',
+    'CLAUDE_CODE_AUTO_COMPACT_WINDOW'
+]);
+
+function publicSettingsConfig(raw: unknown): CcSwitchProvider['settingsConfig'] {
+    if (!raw || typeof raw !== 'object') {
+        return {};
+    }
+    const config = raw as CcSwitchProvider['settingsConfig'];
+    const env: Record<string, string> = {};
+    for (const [key, value] of Object.entries(config.env ?? {})) {
+        if (SAFE_ENV_KEYS.has(key) && typeof value === 'string') {
+            env[key] = value;
+        }
+    }
+    return { env };
+}
+
+export async function getCurrentProvider(appType: 'claude' | 'claude-desktop' = 'claude'): Promise<CcSwitchProvider | null> {
+    const settings = readCcSwitchSettings();
+    const providerId = appType === 'claude-desktop'
+        ? settings?.currentProviderClaudeDesktop
+        : settings?.currentProviderClaude;
+
+    try {
+        const rows = providerId
+            ? await queryCcSwitch(`SELECT id, app_type, name, settings_config, category, icon, icon_color,
+                is_current, cost_multiplier, provider_type FROM providers
+                WHERE id = ? AND app_type = ? LIMIT 1`, [providerId, appType])
+            : await queryCcSwitch(`SELECT id, app_type, name, settings_config, category, icon, icon_color,
+                is_current, cost_multiplier, provider_type FROM providers
+                WHERE app_type = ? AND is_current = 1 ORDER BY rowid DESC LIMIT 1`, [appType]);
+        const row = rows[0];
+        if (!row) {
             return null;
         }
-        const data = fs.readFileSync(filePath, 'utf-8');
-        return parseJson(data) as T | null;
-    } catch {
+        return {
+            id: stringValue(row.id),
+            appType: stringValue(row.app_type),
+            name: stringValue(row.name, '未知供应商'),
+            settingsConfig: publicSettingsConfig(parseJson(stringValue(row.settings_config))),
+            category: stringValue(row.category) || undefined,
+            icon: stringValue(row.icon) || undefined,
+            iconColor: stringValue(row.icon_color) || undefined,
+            isCurrent: row.is_current === 1 || row.is_current === '1',
+            costMultiplier: typeof row.cost_multiplier === 'string'
+                ? row.cost_multiplier
+                : String(numberValue(row.cost_multiplier, 1)),
+            providerType: stringValue(row.provider_type) || undefined
+        };
+    } catch (error) {
+        console.warn('[ccstatusline] Unable to read CC Switch provider:', error);
         return null;
     }
 }
-
-interface CcSwitchSettings {
-    currentProviderClaude?: string;
-    currentProviderClaudeDesktop?: string;
-}
-
-export function readCcSwitchSettings(): CcSwitchSettings | null {
-    return readJsonFile<CcSwitchSettings>(CCSWITCH_SETTINGS_PATH);
-}
-
-function parseProviderRow(row: string): CcSwitchProvider | null {
-    // provider rows are pipe-delimited based on the schema
-    // id|app_type|name|settings_config|website_url|category|created_at|sort_index|notes|icon|icon_color|meta|is_current|in_failover_queue|cost_multiplier|limit_daily_usd|limit_monthly_usd|provider_type
-    const parts = row.split('|');
-    if (parts.length < 14) {
-        return null;
-    }
-
-    const settingsRaw = parseJson(parts[3]);
-    const metaRaw = parseJson(parts[11]);
-
-    return {
-        id: parts[0],
-        appType: parts[1],
-        name: parts[2],
-        settingsConfig: (settingsRaw && typeof settingsRaw === 'object') ? settingsRaw as CcSwitchProvider['settingsConfig'] : {},
-        category: parts[5] || undefined,
-        icon: parts[9] || undefined,
-        iconColor: parts[10] || undefined,
-        meta: (metaRaw && typeof metaRaw === 'object') ? metaRaw as Record<string, unknown> : {},
-        isCurrent: parts[12] === '1',
-        costMultiplier: parts[14] || '1.0',
-        providerType: parts[17] || undefined
-    };
-}
-
-function findSqlite3Binary(): string | null {
-    const candidates: string[] = ['sqlite3'];
-
-    if (process.platform === 'win32') {
-        const localAppData = process.env.LOCALAPPDATA ?? path.join(os.homedir(), 'AppData', 'Local');
-        candidates.push(
-            path.join(localAppData, 'Android', 'Sdk', 'platform-tools', 'sqlite3.exe'),
-            path.join(localAppData, 'Android', 'Sdk', 'platform-tools', 'sqlite3'),
-            'C:\\sqlite\\sqlite3.exe',
-            'C:\\Program Files\\SQLite\\sqlite3.exe',
-            'C:\\Program Files (x86)\\SQLite\\sqlite3.exe'
-        );
-    } else if (process.platform === 'darwin') {
-        candidates.push(
-            '/usr/bin/sqlite3',
-            '/opt/homebrew/bin/sqlite3',
-            '/usr/local/bin/sqlite3'
-        );
-    } else {
-        candidates.push(
-            '/usr/bin/sqlite3',
-            '/usr/local/bin/sqlite3',
-            '/opt/sqlite3',
-            path.join(os.homedir(), '.local', 'bin', 'sqlite3')
-        );
-    }
-
-    for (const candidate of candidates) {
-        try {
-            if (candidate === 'sqlite3') {
-                // Check PATH
-                const { execFileSync } = require('child_process');
-                execFileSync('sqlite3', ['--version'], { stdio: 'ignore' });
-                return candidate;
-            }
-            if (fs.existsSync(candidate)) {
-                return candidate;
-            }
-        } catch {
-            // try next
-        }
-    }
-
-    return null;
-}
-
-function queryDb(sql: string): string[][] {
-    try {
-        if (!fs.existsSync(CCSWITCH_DB_PATH)) {
-            return [];
-        }
-
-        const sqliteBin = findSqlite3Binary();
-        if (!sqliteBin) {
-            return [];
-        }
-
-        const { execFileSync } = require('child_process');
-        const stdout = execFileSync(sqliteBin, [CCSWITCH_DB_PATH, sql], { encoding: 'utf-8' });
-        return stdout
-            .split(/\r?\n/)
-            .filter((line: string) => line.trim() !== '')
-            .map((line: string) => line.split('|'));
-    } catch {
-        return [];
-    }
-}
-
-export function getCurrentProvider(appType: 'claude' | 'claude-desktop' = 'claude'): CcSwitchProvider | null {
-    const settings = readCcSwitchSettings();
-    if (!settings) {
-        return null;
-    }
-
-    const providerId = appType === 'claude-desktop'
-        ? settings.currentProviderClaudeDesktop
-        : settings.currentProviderClaude;
-
-    if (!providerId) {
-        return null;
-    }
-
-    const rows = queryDb(
-        `SELECT * FROM providers WHERE id='${providerId.replace(/'/g, "''")}' AND app_type='${appType.replace(/'/g, "''")}' LIMIT 1;`
-    );
-
-    if (rows.length === 0) {
-        return null;
-    }
-
-    return parseProviderRow(rows[0].join('|'));
-}
-

@@ -2,7 +2,7 @@
   "name": "ccstatusline-kimi",
   "displayName": "ccstatusline-kimi",
   "description": "在 VSCode 底部状态栏显示 Claude Code + Kimi 实时状态：模型、Token、Git、费用等",
-  "version": "0.1.2",
+  "version": "0.2.0",
   "publisher": "haigle",
   "author": "haigle",
   "license": "MIT",
@@ -46,7 +46,7 @@
         "ccstatusline.format": {
           "type": "string",
           "default": "$(comment-discussion) {model} | {git-branch} | {tokens-input} {tokens-output} | {cost} | 已用{context-length}",
-          "description": "状态栏显示格式。可用占位符：{model}, {git-branch}, {git-status}, {tokens-input}, {tokens-output}, {tokens-total}, {cost}, {duration}, {context-pct}, {context-length}, {session-name}"
+          "description": "状态栏显示格式。可用占位符：{model}, {provider}, {thinking-effort}, {git-branch}, {git-status}, {tokens-input}, {tokens-output}, {tokens-cached}, {tokens-total}, {cost}, {session-duration}, {context-pct}, {context-length}, {session-id}, {cwd}, {claude-version}"
         },
         "ccstatusline.statusFilePath": {
           "type": "string",
@@ -89,9 +89,10 @@
   },
   "scripts": {
     "vscode:prepublish": "npm run compile",
-    "compile": "tsc -p ./",
+    "compile": "node -e \"require('fs').rmSync('out',{recursive:true,force:true})\" && tsc -p ./",
     "watch": "tsc -watch -p ./",
     "lint": "eslint src --ext ts",
+    "test": "npm run compile && node --test tests/*.test.js",
     "package": "vsce package"
   },
   "devDependencies": {

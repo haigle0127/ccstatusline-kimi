@@ -12,12 +12,12 @@ export function activate(context: vscode.ExtensionContext): void {
             void manager?.refresh();
         }),
         vscode.commands.registerCommand('ccstatusline.showHistory', () => {
-            HistoryPanel.createOrShow();
+            HistoryPanel.createOrShow(context);
         }),
         vscode.commands.registerCommand('ccstatusline.openSettings', () => {
             void vscode.commands.executeCommand(
                 'workbench.action.openSettings',
-                '@ext:ccstatusline-vscode ccstatusline'
+                '@ext:haigle.ccstatusline-kimi ccstatusline'
             );
         }),
         vscode.commands.registerCommand('ccstatusline.copyStatusJson', () => {

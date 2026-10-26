@@ -5,16 +5,15 @@ import type {
     ClaudeSession,
     ClaudeSettings,
     ClaudeState,
-    SpeedMetrics,
-    TokenMetrics,
-    TranscriptLine
+    TokenMetrics
 } from './types';
-import { getCurrentProvider } from './ccswitch';
+import { getCurrentProvider, readCcSwitchSettings } from './ccswitch';
+import { estimateTranscriptCost, readTranscriptUsage, type TranscriptUsageEvent } from './ccswitchDb';
 
-const CLAUDE_DIR = path.join(os.homedir(), '.claude');
-const SESSIONS_DIR = path.join(CLAUDE_DIR, 'sessions');
-const TRANSCRIPTS_DIR = path.join(CLAUDE_DIR, 'transcripts');
-const SETTINGS_PATH = path.join(CLAUDE_DIR, 'settings.json');
+export function getClaudeConfigDir(): string {
+    const override = readCcSwitchSettings()?.claudeConfigDir?.trim();
+    return override ? override.replace(/^~(?=[\\/])/, os.homedir()) : path.join(os.homedir(), '.claude');
+}
 
 function parseJson(data: string): unknown {
     try {
@@ -26,121 +25,74 @@ function parseJson(data: string): unknown {
 
 function readJsonFile<T>(filePath: string): T | null {
     try {
-        if (!fs.existsSync(filePath)) {
-            return null;
-        }
-        const data = fs.readFileSync(filePath, 'utf-8');
-        return parseJson(data) as T | null;
+        const parsed = parseJson(fs.readFileSync(filePath, 'utf8'));
+        return parsed as T | null;
     } catch {
         return null;
     }
 }
 
-function readJsonlFile(filePath: string): string[] {
-    try {
-        if (!fs.existsSync(filePath)) {
-            return [];
-        }
-        const data = fs.readFileSync(filePath, 'utf-8');
-        return data.split(/\r?\n/).filter(line => line.trim() !== '');
-    } catch {
-        return [];
-    }
+function normalizePath(value: string): string {
+    return path.normalize(value).toLowerCase().replace(/\\/g, '/').replace(/\/$/, '');
 }
 
-function parseJsonlLine(line: string): TranscriptLine | null {
-    const parsed = parseJson(line);
-    if (parsed && typeof parsed === 'object') {
-        return parsed as TranscriptLine;
-    }
-    return null;
-}
-
-function normalizePath(p: string): string {
-    return path.normalize(p).toLowerCase().replace(/\\/g, '/');
+function pathsOverlap(left: string, right: string): boolean {
+    return left === right || left.startsWith(`${right}/`) || right.startsWith(`${left}/`);
 }
 
 export function readClaudeSettings(): ClaudeSettings | null {
-    return readJsonFile<ClaudeSettings>(SETTINGS_PATH);
+    return readJsonFile<ClaudeSettings>(path.join(getClaudeConfigDir(), 'settings.json'));
 }
 
 export function findActiveSession(workspaceFolder?: string): ClaudeSession | null {
     try {
-        if (!fs.existsSync(SESSIONS_DIR)) {
-            return null;
-        }
-
-        const files = fs.readdirSync(SESSIONS_DIR).filter(f => f.endsWith('.json'));
-        const sessions: ClaudeSession[] = [];
-
-        for (const file of files) {
-            const session = readJsonFile<ClaudeSession>(path.join(SESSIONS_DIR, file));
-            if (session) {
-                sessions.push(session);
-            }
-        }
-
-        if (sessions.length === 0) {
-            return null;
-        }
-
-        // Sort by startedAt desc (most recent first)
-        sessions.sort((a, b) => b.startedAt - a.startedAt);
+        const sessionsDir = path.join(getClaudeConfigDir(), 'sessions');
+        const sessions = fs.readdirSync(sessionsDir)
+            .filter(file => file.endsWith('.json'))
+            .map(file => readJsonFile<ClaudeSession>(path.join(sessionsDir, file)))
+            .filter((session): session is ClaudeSession => Boolean(session?.sessionId && session.cwd))
+            .sort((a, b) => b.startedAt - a.startedAt);
 
         if (!workspaceFolder) {
             return sessions[0] ?? null;
         }
-
-        const workspaceNorm = normalizePath(workspaceFolder);
-
-        // Prefer session whose cwd matches current workspace
-        const match = sessions.find(s => workspaceNorm.startsWith(normalizePath(s.cwd)));
-        return match ?? sessions[0] ?? null;
+        const workspace = normalizePath(workspaceFolder);
+        return sessions.find(session => pathsOverlap(workspace, normalizePath(session.cwd))) ?? null;
     } catch {
         return null;
     }
 }
 
 function cwdToProjectDir(cwd: string): string {
-    // VSCode Claude extension stores transcripts under ~/.claude/projects/
-    // with a directory name derived from cwd by replacing path separators
-    // and colons with hyphens.
-    // e.g. d:\code\ccstatusvsline -> d--code-ccstatusvsline
     return cwd.replace(/[:\\/]/g, '-');
 }
 
 function findTranscriptPath(sessionId: string, sessionCwd?: string): string | null {
+    const claudeDir = getClaudeConfigDir();
     const candidates: string[] = [];
-
     try {
-        // VSCode extension layout: ~/.claude/projects/<cwd-derived>/<sessionId>.jsonl
-        const projectsDir = path.join(CLAUDE_DIR, 'projects');
-        if (fs.existsSync(projectsDir) && sessionCwd) {
+        const projectsDir = path.join(claudeDir, 'projects');
+        if (sessionCwd && fs.existsSync(projectsDir)) {
             const projectDir = path.join(projectsDir, cwdToProjectDir(sessionCwd));
-            if (fs.existsSync(projectDir)) {
-                const directPath = path.join(projectDir, `${sessionId}.jsonl`);
-                if (fs.existsSync(directPath)) {
-                    candidates.push(directPath);
-                }
-
-                // Also scan the project dir for any jsonl containing sessionId
-                const files = fs.readdirSync(projectDir).filter(f => f.endsWith('.jsonl'));
-                for (const file of files) {
-                    if (file.includes(sessionId)) {
+            const directPath = path.join(projectDir, `${sessionId}.jsonl`);
+            if (fs.existsSync(directPath)) {
+                candidates.push(directPath);
+            } else if (fs.existsSync(projectDir)) {
+                for (const file of fs.readdirSync(projectDir)) {
+                    if (file.endsWith('.jsonl') && file.includes(sessionId)) {
                         candidates.push(path.join(projectDir, file));
                     }
                 }
             }
 
-            // If no cwd match, search all project dirs for sessionId
             if (candidates.length === 0) {
-                const projectDirs = fs.readdirSync(projectsDir, { withFileTypes: true })
-                    .filter(d => d.isDirectory())
-                    .map(d => path.join(projectsDir, d.name));
-                for (const dir of projectDirs) {
-                    const files = fs.readdirSync(dir).filter(f => f.endsWith('.jsonl'));
-                    for (const file of files) {
-                        if (file.includes(sessionId)) {
+                for (const directory of fs.readdirSync(projectsDir, { withFileTypes: true })) {
+                    if (!directory.isDirectory()) {
+                        continue;
+                    }
+                    const dir = path.join(projectsDir, directory.name);
+                    for (const file of fs.readdirSync(dir)) {
+                        if (file.endsWith('.jsonl') && file.includes(sessionId)) {
                             candidates.push(path.join(dir, file));
                         }
                     }
@@ -148,207 +100,97 @@ function findTranscriptPath(sessionId: string, sessionCwd?: string): string | nu
             }
         }
 
-        // Legacy CLI layout: ~/.claude/transcripts/<sessionId>.jsonl
-        if (fs.existsSync(TRANSCRIPTS_DIR)) {
-            const files = fs.readdirSync(TRANSCRIPTS_DIR).filter(f => f.endsWith('.jsonl'));
-            for (const file of files) {
-                if (file.includes(sessionId)) {
-                    candidates.push(path.join(TRANSCRIPTS_DIR, file));
+        const transcriptsDir = path.join(claudeDir, 'transcripts');
+        if (fs.existsSync(transcriptsDir)) {
+            for (const file of fs.readdirSync(transcriptsDir)) {
+                if (file.endsWith('.jsonl') && file.includes(sessionId)) {
+                    candidates.push(path.join(transcriptsDir, file));
                 }
             }
         }
 
-        if (candidates.length === 0) {
-            return null;
-        }
-
-        // Prefer the most recently modified candidate
-        let best = candidates[0];
-        let bestTime = fs.statSync(best).mtimeMs;
-        for (let i = 1; i < candidates.length; i++) {
-            const stat = fs.statSync(candidates[i]);
-            if (stat.mtimeMs > bestTime) {
-                best = candidates[i];
-                bestTime = stat.mtimeMs;
-            }
-        }
-        return best;
+        return candidates
+            .map(candidate => ({ candidate, mtime: fs.statSync(candidate).mtimeMs }))
+            .sort((a, b) => b.mtime - a.mtime)[0]?.candidate ?? null;
     } catch {
         return null;
     }
 }
 
-export function getTokenMetrics(transcriptPath: string): TokenMetrics {
-    const lines = readJsonlFile(transcriptPath);
+const transcriptCache = new Map<string, { mtimeMs: number; size: number; events: TranscriptUsageEvent[] }>();
 
+function readCachedTranscript(transcriptPath: string): TranscriptUsageEvent[] {
+    try {
+        const stat = fs.statSync(transcriptPath);
+        const cached = transcriptCache.get(transcriptPath);
+        if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) {
+            return cached.events;
+        }
+        const events = readTranscriptUsage(transcriptPath);
+        transcriptCache.set(transcriptPath, { mtimeMs: stat.mtimeMs, size: stat.size, events });
+        if (transcriptCache.size > 20) {
+            const oldest = transcriptCache.keys().next().value;
+            if (oldest) {
+                transcriptCache.delete(oldest);
+            }
+        }
+        return events;
+    } catch {
+        return [];
+    }
+}
+
+function metricsFromEvents(events: TranscriptUsageEvent[]): TokenMetrics {
     let inputTokens = 0;
     let outputTokens = 0;
     let cachedTokens = 0;
-    let contextLength = 0;
-
-    let mostRecentMainChainEntry: TranscriptLine | null = null;
-    let mostRecentTimestamp: Date | null = null;
-
-    const parsedEntries: TranscriptLine[] = [];
-    let hasStopReasonField = false;
-
-    for (const line of lines) {
-        const data = parseJsonlLine(line);
-        if (data?.message?.usage) {
-            parsedEntries.push(data);
-            if (Object.hasOwn(data.message, 'stop_reason')) {
-                hasStopReasonField = true;
-            }
-        }
+    for (const event of events) {
+        inputTokens += event.inputTokens;
+        outputTokens += event.outputTokens;
+        cachedTokens += event.cacheReadTokens + event.cacheCreationTokens;
     }
 
-    const entriesToCount = hasStopReasonField
-        ? parsedEntries.filter((data, index) => {
-            const stopReason = data.message?.stop_reason;
-            return Boolean(stopReason) || (stopReason === null && index === parsedEntries.length - 1);
-        })
-        : parsedEntries;
-
-    for (const data of entriesToCount) {
-        const usage = data.message?.usage;
-        if (!usage) {
-            continue;
-        }
-
-        inputTokens += usage.input_tokens || 0;
-        outputTokens += usage.output_tokens || 0;
-        cachedTokens += usage.cache_read_input_tokens ?? 0;
-        cachedTokens += usage.cache_creation_input_tokens ?? 0;
-
-        if (data.isSidechain !== true && data.timestamp && !data.isApiErrorMessage) {
-            const entryTime = new Date(data.timestamp);
-            if (!Number.isNaN(entryTime.getTime()) &&
-                (!mostRecentTimestamp || entryTime > mostRecentTimestamp)) {
-                mostRecentTimestamp = entryTime;
-                mostRecentMainChainEntry = data;
-            }
-        }
-    }
-
-    if (mostRecentMainChainEntry?.message?.usage) {
-        const usage = mostRecentMainChainEntry.message.usage;
-        contextLength = (usage.input_tokens || 0)
-            + (usage.cache_read_input_tokens ?? 0)
-            + (usage.cache_creation_input_tokens ?? 0);
-    }
-
-    const totalTokens = inputTokens + outputTokens + cachedTokens;
-
-    return { inputTokens, outputTokens, cachedTokens, totalTokens, contextLength };
-}
-
-export function getSessionDuration(transcriptPath: string): string | null {
-    const lines = readJsonlFile(transcriptPath);
-    if (lines.length === 0) {
-        return null;
-    }
-
-    let firstTimestamp: Date | null = null;
-    let lastTimestamp: Date | null = null;
-
-    for (const line of lines) {
-        const data = parseJsonlLine(line);
-        if (data?.timestamp) {
-            const t = new Date(data.timestamp);
-            if (!Number.isNaN(t.getTime())) {
-                firstTimestamp = t;
-                break;
-            }
-        }
-    }
-
-    for (let i = lines.length - 1; i >= 0; i--) {
-        const data = parseJsonlLine(lines[i]);
-        if (data?.timestamp) {
-            const t = new Date(data.timestamp);
-            if (!Number.isNaN(t.getTime())) {
-                lastTimestamp = t;
-                break;
-            }
-        }
-    }
-
-    if (!firstTimestamp || !lastTimestamp) {
-        return null;
-    }
-
-    const durationMs = lastTimestamp.getTime() - firstTimestamp.getTime();
-    const totalMinutes = Math.floor(durationMs / (1000 * 60));
-
-    if (totalMinutes < 1) {
-        return '<1m';
-    }
-
-    const hours = Math.floor(totalMinutes / 60);
-    const minutes = totalMinutes % 60;
-
-    if (hours === 0) {
-        return `${minutes}m`;
-    } else if (minutes === 0) {
-        return `${hours}hr`;
-    } else {
-        return `${hours}hr ${minutes}m`;
-    }
-}
-
-function collectSpeedMetrics(transcriptPath: string): SpeedMetrics | null {
-    const lines = readJsonlFile(transcriptPath);
-    if (lines.length === 0) {
-        return null;
-    }
-
-    let inputTokens = 0;
-    let outputTokens = 0;
-    let requestCount = 0;
-
-    let lastUserTimestamp: Date | null = null;
-    let totalDurationMs = 0;
-
-    for (const line of lines) {
-        const data = parseJsonlLine(line);
-        if (!data || data.isApiErrorMessage) {
-            continue;
-        }
-
-        const entryTimestamp = data.timestamp ? new Date(data.timestamp) : null;
-
-        if (data.type === 'user' && entryTimestamp && !Number.isNaN(entryTimestamp.getTime())) {
-            lastUserTimestamp = entryTimestamp;
-            continue;
-        }
-
-        if (data.type === 'assistant' && data.message?.usage) {
-            inputTokens += data.message.usage.input_tokens || 0;
-            outputTokens += data.message.usage.output_tokens || 0;
-            requestCount++;
-
-            if (entryTimestamp && lastUserTimestamp) {
-                const diff = entryTimestamp.getTime() - lastUserTimestamp.getTime();
-                if (diff > 0) {
-                    totalDurationMs += diff;
-                }
-            }
-        }
-    }
+    const latest = events
+        .filter(event => !event.isSidechain)
+        .sort((a, b) => b.timestamp - a.timestamp)[0];
+    const contextLength = latest
+        ? latest.inputTokens + latest.cacheReadTokens + latest.cacheCreationTokens + latest.outputTokens
+        : 0;
 
     return {
-        totalDurationMs,
         inputTokens,
         outputTokens,
-        totalTokens: inputTokens + outputTokens,
-        requestCount
+        cachedTokens,
+        totalTokens: inputTokens + outputTokens + cachedTokens,
+        contextLength,
+        model: latest?.model
     };
 }
 
-export function collectClaudeState(workspaceFolder?: string): ClaudeState {
+export function getTokenMetrics(transcriptPath: string): TokenMetrics {
+    return metricsFromEvents(readCachedTranscript(transcriptPath));
+}
+
+function formatDuration(start: number, end: number): string | null {
+    if (!Number.isFinite(start) || !Number.isFinite(end)) {
+        return null;
+    }
+    const totalMinutes = Math.max(0, Math.floor((end - start) / 60));
+    if (totalMinutes < 1) {
+        return '<1m';
+    }
+    const hours = Math.floor(totalMinutes / 60);
+    const minutes = totalMinutes % 60;
+    if (hours === 0) {
+        return `${minutes}m`;
+    }
+    return minutes === 0 ? `${hours}hr` : `${hours}hr ${minutes}m`;
+}
+
+export async function collectClaudeState(workspaceFolder?: string): Promise<ClaudeState> {
     const settings = readClaudeSettings();
     const session = findActiveSession(workspaceFolder);
-    const provider = getCurrentProvider('claude');
+    const [provider] = await Promise.all([getCurrentProvider('claude')]);
 
     let tokenMetrics: TokenMetrics = {
         inputTokens: 0,
@@ -357,15 +199,27 @@ export function collectClaudeState(workspaceFolder?: string): ClaudeState {
         totalTokens: 0,
         contextLength: 0
     };
-    let speedMetrics: SpeedMetrics | null = null;
     let sessionDuration: string | null = null;
+    let transcriptPath: string | null = null;
+    let activityAt = session?.startedAt ?? 0;
+    let sessionCost: ClaudeState['sessionCost'] = { totalCost: null, unpricedRequests: 0, pricedRequests: 0, multiplier: 1 };
 
     if (session) {
-        const transcriptPath = findTranscriptPath(session.sessionId, session.cwd);
+        transcriptPath = findTranscriptPath(session.sessionId, session.cwd);
         if (transcriptPath) {
-            tokenMetrics = getTokenMetrics(transcriptPath);
-            sessionDuration = getSessionDuration(transcriptPath);
-            speedMetrics = collectSpeedMetrics(transcriptPath);
+            const events = readCachedTranscript(transcriptPath);
+            tokenMetrics = metricsFromEvents(events);
+            const timestamps = events.map(event => event.timestamp);
+            sessionDuration = timestamps.length > 0
+                ? formatDuration(Math.min(...timestamps), Math.max(...timestamps))
+                : null;
+            activityAt = fs.statSync(transcriptPath).mtimeMs;
+            const multiplier = Number.parseFloat(provider?.costMultiplier ?? '1');
+            const normalizedMultiplier = Number.isFinite(multiplier) ? multiplier : 1;
+            sessionCost = {
+                ...await estimateTranscriptCost(events, normalizedMultiplier),
+                multiplier: normalizedMultiplier
+            };
         }
     }
 
@@ -374,9 +228,12 @@ export function collectClaudeState(workspaceFolder?: string): ClaudeState {
         settings,
         provider,
         tokenMetrics,
-        speedMetrics,
+        speedMetrics: null,
+        sessionCost,
         sessionDuration,
         gitInfo: {},
+        transcriptPath,
+        activityAt,
         updatedAt: Date.now()
     };
 }

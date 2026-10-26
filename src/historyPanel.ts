@@ -1,866 +1,200 @@
 import * as vscode from 'vscode';
-import {
-    getUsageSummary,
-    getDailyTrends,
-    type UsageSummary,
-    type DailyStats,
-} from './ccswitchDb';
+import { getDateRangePreset, getModelPricing, getUsageDashboard } from './ccswitchDb';
 
-function formatTokens(n: number): string {
-    if (n >= 1_000_000) {
-        return `${(n / 1_000_000).toFixed(2)}`;
-    }
-    if (n >= 1_000) {
-        return `${(n / 1_000).toFixed(1)}`;
-    }
-    return n.toString();
-}
-
-function formatTokensWan(n: number): string {
-    if (n >= 10_000) {
-        return `${(n / 10_000).toFixed(1)}万`;
-    }
-    return n.toString();
-}
-
-function formatCost(usd: number): string {
-    return `$${usd.toFixed(4)}`;
-}
-
-function formatPct(n: number): string {
-    return `${(n * 100).toFixed(1)}%`;
-}
-
-function getDateRangePreset(preset: string): { start: Date; end: Date } {
-    const now = new Date();
-    const end = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 23, 59, 59);
-
-    switch (preset) {
-        case 'today': {
-            const start = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0);
-            return { start, end };
-        }
-        case 'yesterday': {
-            const start = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1, 0, 0, 0);
-            const yEnd = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1, 23, 59, 59);
-            return { start, end: yEnd };
-        }
-        case 'week': {
-            const day = now.getDay() || 7;
-            const start = new Date(now.getFullYear(), now.getMonth(), now.getDate() - day + 1, 0, 0, 0);
-            return { start, end };
-        }
-        case 'month': {
-            const start = new Date(now.getFullYear(), now.getMonth(), 1, 0, 0, 0);
-            return { start, end };
-        }
-        default: {
-            const start = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0);
-            return { start, end };
-        }
-    }
-}
+const PRESETS = new Set(['today', 'yesterday', '7d', 'week', '30d', 'month']);
 
 export class HistoryPanel {
-    public static currentPanel: HistoryPanel | undefined;
-    private readonly panel: vscode.WebviewPanel;
-    private disposables: vscode.Disposable[] = [];
-    private currentPreset = 'today';
+    private static currentPanel: HistoryPanel | undefined;
+    private readonly disposables: vscode.Disposable[] = [];
+    private currentPreset: string;
+    private refreshVersion = 0;
 
-    public static createOrShow() {
-        const column = vscode.ViewColumn.One;
+    public static createOrShow(context: vscode.ExtensionContext): void {
         if (HistoryPanel.currentPanel) {
-            HistoryPanel.currentPanel.panel.reveal(column);
-            HistoryPanel.currentPanel.refreshData();
+            HistoryPanel.currentPanel.panel.reveal(vscode.ViewColumn.One);
+            void HistoryPanel.currentPanel.refreshData();
             return;
         }
 
         const panel = vscode.window.createWebviewPanel(
             'ccstatusline.history',
-            'Claude Code 使用统计',
-            column,
-            { enableScripts: true }
+            'Claude Code 用量',
+            vscode.ViewColumn.One,
+            {
+                enableScripts: true,
+                retainContextWhenHidden: true,
+                localResourceRoots: [vscode.Uri.joinPath(context.extensionUri, 'media')]
+            }
         );
-
-        HistoryPanel.currentPanel = new HistoryPanel(panel);
+        HistoryPanel.currentPanel = new HistoryPanel(panel, context);
     }
 
-    private constructor(panel: vscode.WebviewPanel) {
-        this.panel = panel;
-        this.panel.webview.html = this.getHtml();
-        this.panel.onDidDispose(() => this.dispose(), null, this.disposables);
+    private constructor(
+        private readonly panel: vscode.WebviewPanel,
+        private readonly context: vscode.ExtensionContext
+    ) {
+        this.currentPreset = context.globalState.get<string>('ccstatusline.historyPreset', 'today');
+        if (!PRESETS.has(this.currentPreset)) {
+            this.currentPreset = 'today';
+        }
 
-        this.panel.webview.onDidReceiveMessage(
-            message => {
-                switch (message.command) {
-                    case 'ready':
-                        this.refreshData();
-                        return;
-                    case 'refresh':
-                        this.refreshData();
-                        return;
-                    case 'changePreset':
+        const scriptUri = panel.webview.asWebviewUri(vscode.Uri.joinPath(context.extensionUri, 'media', 'history.js'));
+        const styleUri = panel.webview.asWebviewUri(vscode.Uri.joinPath(context.extensionUri, 'media', 'history.css'));
+        panel.webview.html = this.getHtml(scriptUri, styleUri);
+        panel.onDidDispose(() => this.dispose(), null, this.disposables);
+        panel.onDidChangeViewState(event => {
+            if (event.webviewPanel.visible) {
+                void this.refreshData();
+            }
+        }, null, this.disposables);
+        panel.webview.onDidReceiveMessage(message => {
+            if (!message || typeof message !== 'object') {
+                return;
+            }
+            switch (message.command) {
+                case 'ready':
+                case 'refresh':
+                    void this.refreshData();
+                    return;
+                case 'changePreset':
+                    if (PRESETS.has(message.preset)) {
                         this.currentPreset = message.preset;
-                        this.refreshData();
-                        return;
-                }
-            },
-            null,
-            this.disposables
-        );
+                        void context.globalState.update('ccstatusline.historyPreset', this.currentPreset);
+                        void this.refreshData();
+                    }
+                    return;
+                case 'openSettings':
+                    void vscode.commands.executeCommand('workbench.action.openSettings', '@ext:haigle.ccstatusline-kimi ccstatusline');
+                    return;
+            }
+        }, null, this.disposables);
     }
 
-    private async refreshData() {
+    private async refreshData(): Promise<void> {
+        const version = ++this.refreshVersion;
+        await this.panel.webview.postMessage({ command: 'loading' });
         try {
-            this.panel.webview.postMessage({ command: 'loading' });
-
-            const { start, end } = getDateRangePreset(this.currentPreset);
-            console.log('[ccstatusline] refreshData range:', start.toISOString(), 'to', end.toISOString());
-
-            const [summary, trends] = await Promise.all([
-                getUsageSummary(start, end, 'claude'),
-                getDailyTrends(start, end, 'claude'),
-            ]);
-
-            console.log('[ccstatusline] summary:', JSON.stringify(summary));
-            console.log('[ccstatusline] trends count:', trends.length);
-
-            this.panel.webview.postMessage({
-                command: 'setData',
-                summary,
-                trends,
-                preset: this.currentPreset,
-            });
-        } catch (err) {
-            const msg = err instanceof Error ? err.message : String(err);
-            console.error('[ccstatusline] refreshData error:', msg);
-            this.panel.webview.postMessage({
+            await getModelPricing(true);
+            const data = await getUsageDashboard(getDateRangePreset(this.currentPreset));
+            if (version !== this.refreshVersion) {
+                return;
+            }
+            await this.panel.webview.postMessage({ command: 'setData', data, preset: this.currentPreset });
+        } catch (error) {
+            if (version !== this.refreshVersion) {
+                return;
+            }
+            await this.panel.webview.postMessage({
                 command: 'error',
-                message: msg,
+                message: error instanceof Error ? error.message : String(error)
             });
         }
     }
 
-    private getHtml(): string {
+    private getHtml(scriptUri: vscode.Uri, styleUri: vscode.Uri): string {
+        const nonce = Math.random().toString(36).slice(2) + Date.now().toString(36);
+        const csp = `default-src 'none'; style-src ${this.panel.webview.cspSource}; script-src 'nonce-${nonce}'; img-src ${this.panel.webview.cspSource} data:; font-src ${this.panel.webview.cspSource}`;
         return /* html */ `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Claude Code 使用统计</title>
-    <style>
-        * { box-sizing: border-box; margin: 0; padding: 0; }
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-            padding: 20px;
-            color: var(--vscode-foreground);
-            background: var(--vscode-editor-background);
-        }
-        .container { max-width: 800px; margin: 0 auto; }
-
-        .header {
-            margin-bottom: 16px;
-        }
-        .header h1 {
-            font-size: 18px;
-            font-weight: 600;
-            margin-bottom: 4px;
-        }
-        .header p {
-            font-size: 12px;
-            color: var(--vscode-descriptionForeground);
-        }
-
-        .toolbar {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            margin-bottom: 16px;
-            gap: 8px;
-        }
-        .preset-select {
-            padding: 6px 10px;
-            font-size: 13px;
-            border-radius: 6px;
-            border: 1px solid var(--vscode-input-border);
-            background: var(--vscode-input-background);
-            color: var(--vscode-input-foreground);
-            cursor: pointer;
-        }
-        .btn {
-            padding: 6px 14px;
-            font-size: 13px;
-            border-radius: 6px;
-            border: 1px solid var(--vscode-button-border);
-            background: var(--vscode-button-background);
-            color: var(--vscode-button-foreground);
-            cursor: pointer;
-        }
-        .btn:hover { opacity: 0.9; }
-
-        .hero-card {
-            background: var(--vscode-sideBar-background);
-            border: 1px solid var(--vscode-panel-border);
-            border-radius: 12px;
-            padding: 24px;
-            margin-bottom: 16px;
-        }
-        .hero-header {
-            display: flex;
-            align-items: center;
-            gap: 8px;
-            margin-bottom: 12px;
-        }
-        .hero-icon {
-            width: 24px;
-            height: 24px;
-            border-radius: 50%;
-            background: #f59e0b;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            font-size: 12px;
-        }
-        .hero-title {
-            font-size: 14px;
-            color: var(--vscode-descriptionForeground);
-        }
-        .hero-main {
-            display: flex;
-            justify-content: space-between;
-            align-items: flex-start;
-            flex-wrap: wrap;
-            gap: 16px;
-        }
-        .hero-number {
-            font-size: 36px;
-            font-weight: 700;
-            line-height: 1;
-            margin-bottom: 6px;
-        }
-        .hero-sub {
-            font-size: 13px;
-            color: var(--vscode-descriptionForeground);
-        }
-        .hero-meta {
-            display: flex;
-            gap: 20px;
-            text-align: right;
-        }
-        .hero-meta-item {
-            display: flex;
-            flex-direction: column;
-            gap: 2px;
-        }
-        .hero-meta-label {
-            font-size: 12px;
-            color: var(--vscode-descriptionForeground);
-        }
-        .hero-meta-value {
-            font-size: 14px;
-            font-weight: 600;
-        }
-
-        .stats-grid {
-            display: grid;
-            grid-template-columns: repeat(4, 1fr);
-            gap: 12px;
-            margin-bottom: 16px;
-        }
-        .stat-card {
-            background: var(--vscode-sideBar-background);
-            border: 1px solid var(--vscode-panel-border);
-            border-radius: 10px;
-            padding: 16px;
-        }
-        .stat-card-label {
-            font-size: 12px;
-            color: var(--vscode-descriptionForeground);
-            margin-bottom: 8px;
-        }
-        .stat-card-value {
-            font-size: 20px;
-            font-weight: 600;
-        }
-
-        .progress-section {
-            background: var(--vscode-sideBar-background);
-            border: 1px solid var(--vscode-panel-border);
-            border-radius: 10px;
-            padding: 16px;
-            margin-bottom: 16px;
-        }
-        .progress-header {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            margin-bottom: 10px;
-        }
-        .progress-label {
-            font-size: 13px;
-            color: var(--vscode-descriptionForeground);
-        }
-        .progress-value {
-            font-size: 14px;
-            font-weight: 600;
-            color: #10b981;
-        }
-        .progress-bar-bg {
-            height: 8px;
-            background: var(--vscode-progressBar-background);
-            border-radius: 4px;
-            overflow: hidden;
-        }
-        .progress-bar-fill {
-            height: 100%;
-            background: #10b981;
-            border-radius: 4px;
-            transition: width 0.3s ease;
-        }
-
-        .pet-section {
-            background: var(--vscode-sideBar-background);
-            border: 1px solid var(--vscode-panel-border);
-            border-radius: 12px;
-            padding: 20px 24px;
-            margin-bottom: 16px;
-            display: flex;
-            align-items: center;
-            gap: 20px;
-            position: relative;
-            overflow: hidden;
-        }
-        .pet-section::before {
-            content: '';
-            position: absolute;
-            top: -50%;
-            left: -50%;
-            width: 200%;
-            height: 200%;
-            background: radial-gradient(circle at 30% 50%, rgba(245, 158, 11, 0.08) 0%, transparent 50%);
-            pointer-events: none;
-        }
-        .pet-canvas {
-            width: 80px;
-            height: 80px;
-            flex-shrink: 0;
-            position: relative;
-            cursor: pointer;
-            transition: transform 0.2s ease;
-        }
-        .pet-canvas:hover {
-            transform: scale(1.05);
-        }
-        .pet-canvas:active {
-            transform: scale(0.95);
-        }
-        .pet-body {
-            width: 56px;
-            height: 48px;
-            background: #f59e0b;
-            border-radius: 50%;
-            position: absolute;
-            bottom: 8px;
-            left: 50%;
-            transform: translateX(-50%);
-            animation: petFloat 2.5s ease-in-out infinite;
-            box-shadow: 0 4px 12px rgba(245, 158, 11, 0.3);
-        }
-        .pet-eye {
-            width: 10px;
-            height: 10px;
-            background: #1f2937;
-            border-radius: 50%;
-            position: absolute;
-            top: 14px;
-            animation: petBlink 4s ease-in-out infinite;
-        }
-        .pet-eye.left { left: 12px; }
-        .pet-eye.right { right: 12px; }
-        .pet-eye::after {
-            content: '';
-            width: 3px;
-            height: 3px;
-            background: white;
-            border-radius: 50%;
-            position: absolute;
-            top: 2px;
-            right: 2px;
-        }
-        .pet-tentacle {
-            width: 8px;
-            height: 18px;
-            background: #f59e0b;
-            border-radius: 4px;
-            position: absolute;
-            bottom: -8px;
-            animation: petWiggle 1.5s ease-in-out infinite;
-        }
-        .pet-tentacle.t1 { left: 8px; animation-delay: 0s; }
-        .pet-tentacle.t2 { left: 20px; animation-delay: 0.2s; }
-        .pet-tentacle.t3 { right: 20px; animation-delay: 0.4s; }
-        .pet-tentacle.t4 { right: 8px; animation-delay: 0.6s; }
-        .pet-blush {
-            width: 10px;
-            height: 6px;
-            background: rgba(239, 68, 68, 0.3);
-            border-radius: 50%;
-            position: absolute;
-            top: 26px;
-        }
-        .pet-blush.left { left: 6px; }
-        .pet-blush.right { right: 6px; }
-        .pet-mouth {
-            width: 12px;
-            height: 6px;
-            border-bottom: 2px solid #1f2937;
-            border-radius: 0 0 50% 50%;
-            position: absolute;
-            top: 28px;
-            left: 50%;
-            transform: translateX(-50%);
-        }
-        .pet-heart {
-            position: absolute;
-            color: #ef4444;
-            font-size: 16px;
-            pointer-events: none;
-            opacity: 0;
-            animation: none;
-        }
-        .pet-heart.active {
-            animation: heartFloat 1s ease-out forwards;
-        }
-        .pet-info {
-            flex: 1;
-            min-width: 0;
-            position: relative;
-            z-index: 1;
-        }
-        .pet-name {
-            font-size: 15px;
-            font-weight: 600;
-            margin-bottom: 4px;
-        }
-        .pet-status {
-            font-size: 12px;
-            color: var(--vscode-descriptionForeground);
-            margin-bottom: 8px;
-        }
-        .pet-stats {
-            display: flex;
-            gap: 16px;
-        }
-        .pet-stat {
-            display: flex;
-            flex-direction: column;
-            gap: 2px;
-        }
-        .pet-stat-label {
-            font-size: 11px;
-            color: var(--vscode-descriptionForeground);
-        }
-        .pet-stat-value {
-            font-size: 13px;
-            font-weight: 600;
-        }
-        .pet-bar {
-            width: 80px;
-            height: 4px;
-            background: var(--vscode-progressBar-background);
-            border-radius: 2px;
-            overflow: hidden;
-            margin-top: 2px;
-        }
-        .pet-bar-fill {
-            height: 100%;
-            border-radius: 2px;
-            transition: width 0.5s ease;
-        }
-        .pet-bar-fill.mood { background: #f59e0b; }
-        .pet-bar-fill.energy { background: #10b981; }
-        @keyframes petFloat {
-            0%, 100% { transform: translateX(-50%) translateY(0); }
-            50% { transform: translateX(-50%) translateY(-4px); }
-        }
-        @keyframes petBlink {
-            0%, 48%, 52%, 100% { transform: scaleY(1); }
-            50% { transform: scaleY(0.1); }
-        }
-        @keyframes petWiggle {
-            0%, 100% { transform: rotate(-5deg); }
-            50% { transform: rotate(5deg); }
-        }
-        @keyframes heartFloat {
-            0% { opacity: 1; transform: translateY(0) scale(0.5); }
-            50% { opacity: 1; transform: translateY(-20px) scale(1); }
-            100% { opacity: 0; transform: translateY(-40px) scale(1.2); }
-        }
-        .pet-jump {
-            animation: petJump 0.4s ease-out !important;
-        }
-        @keyframes petJump {
-            0% { transform: translateX(-50%) translateY(0) scale(1); }
-            40% { transform: translateX(-50%) translateY(-20px) scale(1.1); }
-            100% { transform: translateX(-50%) translateY(0) scale(1); }
-        }
-
-        .trend-table {
-            background: var(--vscode-sideBar-background);
-            border: 1px solid var(--vscode-panel-border);
-            border-radius: 10px;
-            overflow: hidden;
-        }
-        .trend-table-header {
-            display: grid;
-            grid-template-columns: 1fr 1fr 1fr 1fr 1fr;
-            padding: 12px 16px;
-            background: var(--vscode-editor-background);
-            border-bottom: 1px solid var(--vscode-panel-border);
-            font-size: 12px;
-            font-weight: 600;
-            color: var(--vscode-descriptionForeground);
-        }
-        .trend-row {
-            display: grid;
-            grid-template-columns: 1fr 1fr 1fr 1fr 1fr;
-            padding: 10px 16px;
-            border-bottom: 1px solid var(--vscode-panel-border);
-            font-size: 13px;
-        }
-        .trend-row:last-child {
-            border-bottom: none;
-        }
-
-        .loading, .error, .empty {
-            text-align: center;
-            padding: 60px 20px;
-        }
-        .error {
-            color: var(--vscode-errorForeground);
-        }
-
-        @media (max-width: 600px) {
-            .stats-grid { grid-template-columns: repeat(2, 1fr); }
-            .hero-main { flex-direction: column; }
-            .hero-meta { text-align: left; width: 100%; }
-            .trend-table-header,
-            .trend-row { grid-template-columns: 1fr 1fr; gap: 8px; }
-        }
-    </style>
+    <meta http-equiv="Content-Security-Policy" content="${csp}">
+    <title>Claude Code 用量</title>
+    <link rel="stylesheet" href="${styleUri}">
 </head>
 <body>
-    <div class="container">
-        <div class="header">
-            <h1>Claude Code 使用统计</h1>
-            <p>数据来源: ~/.cc-switch/cc-switch.db</p>
-        </div>
-
-        <div class="pet-section" id="petSection" style="display:none;">
-            <div class="pet-canvas" id="petCanvas" title="点击我！">
-                <div class="pet-heart" id="petHeart">❤</div>
-                <div class="pet-body" id="petBody">
-                    <div class="pet-eye left"></div>
-                    <div class="pet-eye right"></div>
-                    <div class="pet-blush left"></div>
-                    <div class="pet-blush right"></div>
-                    <div class="pet-mouth"></div>
-                </div>
-                <div class="pet-tentacle t1"></div>
-                <div class="pet-tentacle t2"></div>
-                <div class="pet-tentacle t3"></div>
-                <div class="pet-tentacle t4"></div>
+    <div class="app-shell">
+        <header class="page-header">
+            <div class="brand">
+                <span class="brand-mark" aria-hidden="true">✦</span>
+                <div><h1>Claude Code 用量</h1><p>本地读取，让每一份消耗都有据可查</p></div>
             </div>
-            <div class="pet-info">
-                <div class="pet-name">Claude 小章鱼</div>
-                <div class="pet-status" id="petStatus">正在休息...</div>
-                <div class="pet-stats">
-                    <div class="pet-stat">
-                        <span class="pet-stat-label">心情</span>
-                        <span class="pet-stat-value" id="petMoodVal">--</span>
-                        <div class="pet-bar"><div class="pet-bar-fill mood" id="petMoodBar" style="width:0%"></div></div>
+            <button class="icon-button" id="refreshBtn" type="button" title="刷新数据" aria-label="刷新数据">↻</button>
+        </header>
+        <main class="container">
+            <section class="toolbar" aria-label="统计筛选">
+                <label class="range-control">时间范围
+                    <select id="presetSelect">
+                        <option value="today">今日</option>
+                        <option value="yesterday">昨日</option>
+                        <option value="7d">近 7 天</option>
+                        <option value="week">本周</option>
+                        <option value="30d">近 30 天</option>
+                        <option value="month">本月</option>
+                    </select>
+                </label>
+                <div class="source-meta"><span class="source-dot" aria-hidden="true"></span><span id="sourceLabel">正在读取本地数据</span><span class="meta-separator">·</span><span id="updatedAt"></span></div>
+            </section>
+            <div id="errorBanner" class="error-banner" role="alert" hidden></div>
+            <div id="content" class="content" aria-busy="true">
+                <section class="pet-card" id="petCard">
+                    <button class="pet-canvas" id="petCanvas" type="button" aria-label="和 Claude 小章鱼互动" title="点我一下">
+                        <span class="pet-heart" id="petHeart">♥</span><span class="pet-body" id="petBody"><i class="pet-eye left"></i><i class="pet-eye right"></i><i class="pet-mouth"></i></span>
+                        <span class="pet-tentacle t1"></span><span class="pet-tentacle t2"></span><span class="pet-tentacle t3"></span><span class="pet-tentacle t4"></span>
+                    </button>
+                    <div class="pet-copy"><strong>Claude 小章鱼</strong><span id="petStatus">等你一起写代码</span></div>
+                    <div class="pet-level"><span>今日活力</span><strong id="petEnergy">—</strong><div class="pet-meter"><i id="petEnergyFill"></i></div></div>
+                </section>
+                <section class="card metrics-card" aria-label="核心指标">
+                    <div class="metrics-grid">
+                        <button class="metric selected" data-metric="tokens" aria-pressed="true"><span>总 Tokens</span><strong id="metricTokens">—</strong><small id="metricTokensSub">新增输入 + 输出 + 缓存</small></button>
+                        <button class="metric" data-metric="cost" aria-pressed="false"><span>估算成本</span><strong id="metricCost">—</strong><small id="metricCostSub">按 CC Switch 定价</small></button>
+                        <button class="metric" data-metric="requests" aria-pressed="false"><span>请求数</span><strong id="metricRequests">—</strong><small id="metricSuccess">去重后的模型响应</small></button>
+                        <button class="metric" data-metric="hitRate" aria-pressed="false"><span>缓存命中率</span><strong id="metricHitRate">—</strong><small>缓存读取 ÷ 可缓存输入</small></button>
                     </div>
-                    <div class="pet-stat">
-                        <span class="pet-stat-label">活跃</span>
-                        <span class="pet-stat-value" id="petEnergyVal">--</span>
-                        <div class="pet-bar"><div class="pet-bar-fill energy" id="petEnergyBar" style="width:0%"></div></div>
-                    </div>
+                </section>
+
+                <div class="primary-grid">
+                    <section class="card chart-card" aria-labelledby="trendTitle">
+                        <div class="card-heading"><div><h2 id="trendTitle">Token 趋势</h2><p id="trendSubtitle">按日统计</p></div><span class="chart-unit" id="chartUnit">tokens</span></div>
+                        <div class="chart-wrap" id="chartWrap">
+                            <svg id="trendChart" viewBox="0 0 720 250" role="img" aria-label="用量趋势图"></svg>
+                            <div id="chartTooltip" class="chart-tooltip" role="status" hidden></div>
+                            <div id="chartEmpty" class="chart-empty" hidden>当前范围没有可绘制的数据</div>
+                        </div>
+                    </section>
+                    <aside class="insight-column">
+                        <section class="card cache-card">
+                            <div class="card-heading"><h2>缓存效率</h2><span class="subtle-badge">输入复用</span></div>
+                            <div class="cache-value" id="cacheValue">—</div>
+                            <div class="meter" role="meter" aria-label="缓存命中率" aria-valuemin="0" aria-valuemax="100" id="cacheMeter"><div id="cacheFill"></div></div>
+                            <div class="cache-breakdown"><span>缓存读取 <strong id="cacheRead">—</strong></span><span>缓存写入 <strong id="cacheWrite">—</strong></span></div>
+                        </section>
+                        <section class="card composition-card">
+                            <div class="card-heading"><h2>Token 构成</h2><span class="subtle-badge" id="compositionTotal">—</span></div>
+                            <div class="composition-bar" id="compositionBar" aria-hidden="true"></div>
+                            <div class="composition-legend" id="compositionLegend"></div>
+                        </section>
+                    </aside>
                 </div>
+
+                <section class="card details-card">
+                    <div class="details-header"><div class="tabs" role="tablist" aria-label="用量明细">
+                        <button role="tab" id="tab-daily" aria-selected="true" data-tab="daily">每日明细</button>
+                        <button role="tab" id="tab-models" aria-selected="false" data-tab="models">按模型</button>
+                        <button role="tab" id="tab-providers" aria-selected="false" data-tab="providers">按供应商</button>
+                    </div><span class="table-hint">完整数值 · 与上方同口径</span></div>
+                    <div class="table-wrap" id="detailsTable" role="tabpanel" aria-labelledby="tab-daily"></div>
+                </section>
+
+                <p class="data-note" id="dataNote">Token 来自本地记录；成本为模型定价估算，不等于供应商实际账单。</p>
             </div>
-        </div>
-
-        <div class="toolbar">
-            <select class="preset-select" id="presetSelect">
-                <option value="today">今日</option>
-                <option value="yesterday">昨日</option>
-                <option value="week">本周</option>
-                <option value="month">本月</option>
-            </select>
-            <button class="btn" id="refreshBtn">刷新</button>
-        </div>
-
-        <div id="content">
-            <div class="loading">正在加载数据...</div>
-        </div>
+            <div id="emptyState" class="empty-state card" hidden><span aria-hidden="true">⌁</span><h2>这段时间还很安静</h2><p>使用 Claude Code 发起对话后，用量会显示在这里。</p><button id="emptyRefresh" type="button">重新读取</button></div>
+            <div id="initialLoading" class="initial-loading">正在整理本地用量…</div>
+        </main>
     </div>
-
-    <script>
-        (function() {
-            var vscode;
-            try {
-                vscode = acquireVsCodeApi();
-            } catch (e) {
-                document.getElementById('content').innerHTML = '<div class="error">acquireVsCodeApi 失败</div>';
-                return;
-            }
-
-            function formatTokens(n) {
-                if (n >= 1000000) return (n / 1000000).toFixed(2);
-                if (n >= 1000) return (n / 1000).toFixed(1);
-                return n.toString();
-            }
-
-            function formatTokensWan(n) {
-                if (n >= 10000) return (n / 10000).toFixed(1) + '万';
-                return n.toString();
-            }
-
-            function formatCost(usd) {
-                return '$' + usd.toFixed(4);
-            }
-
-            function formatPct(n) {
-                return (n * 100).toFixed(1) + '%';
-            }
-
-            // ========== Pet System ==========
-            var petState = {
-                mood: 60,
-                energy: 50,
-                clickCount: 0,
-                lastClick: 0
-            };
-
-            function computePetState(summary) {
-                var tokens = summary ? (summary.realTotalTokens || 0) : 0;
-                var requests = summary ? (summary.totalRequests || 0) : 0;
-                // Energy based on tokens usage (more usage = more active)
-                var energy = Math.min(100, 20 + Math.min(tokens / 5000, 80));
-                // Mood based on request count + click bonus
-                var mood = Math.min(100, 30 + Math.min(requests * 3, 50) + Math.min(petState.clickCount * 5, 20));
-                petState.energy = Math.round(energy);
-                petState.mood = Math.round(mood);
-            }
-
-            function renderPet() {
-                var section = document.getElementById('petSection');
-                if (!section) { return; }
-                section.style.display = 'flex';
-                var moodEl = document.getElementById('petMoodVal');
-                var moodBar = document.getElementById('petMoodBar');
-                var energyEl = document.getElementById('petEnergyVal');
-                var energyBar = document.getElementById('petEnergyBar');
-                var statusEl = document.getElementById('petStatus');
-                if (moodEl) { moodEl.textContent = petState.mood; }
-                if (moodBar) { moodBar.style.width = petState.mood + '%'; }
-                if (energyEl) { energyEl.textContent = petState.energy; }
-                if (energyBar) { energyBar.style.width = petState.energy + '%'; }
-                if (statusEl) {
-                    var msgs = [
-                        { threshold: 80, text: '超开心！今天写了很多代码呢~' },
-                        { threshold: 60, text: '心情不错，继续加油！' },
-                        { threshold: 40, text: '还不错，去写点代码吧~' },
-                        { threshold: 20, text: '有点无聊...快敲键盘！' },
-                        { threshold: 0, text: '...我快睡着了' }
-                    ];
-                    var msg = msgs.find(function(m) { return petState.mood >= m.threshold; });
-                    statusEl.textContent = msg ? msg.text : '...';
-                }
-            }
-
-            function petInteract() {
-                var now = Date.now();
-                if (now - petState.lastClick < 300) { return; }
-                petState.lastClick = now;
-                petState.clickCount++;
-                petState.mood = Math.min(100, petState.mood + 5);
-
-                var body = document.getElementById('petBody');
-                var heart = document.getElementById('petHeart');
-                if (body) {
-                    body.classList.remove('pet-jump');
-                    void body.offsetWidth;
-                    body.classList.add('pet-jump');
-                    setTimeout(function() { body.classList.remove('pet-jump'); }, 400);
-                }
-                if (heart) {
-                    heart.classList.remove('active');
-                    void heart.offsetWidth;
-                    heart.classList.add('active');
-                    setTimeout(function() { heart.classList.remove('active'); }, 1000);
-                }
-                renderPet();
-            }
-
-            document.getElementById('petCanvas').addEventListener('click', petInteract);
-
-            function renderHero(summary) {
-                return '<div class="hero-card">' +
-                    '<div class="hero-header">' +
-                        '<div class="hero-icon">⚡</div>' +
-                        '<span class="hero-title">Claude Code · 真实消耗 Tokens</span>' +
-                    '</div>' +
-                    '<div class="hero-main">' +
-                        '<div>' +
-                            '<div class="hero-number">' + formatTokens(summary.realTotalTokens) + '</div>' +
-                            '<div class="hero-sub">≈ ' + formatTokensWan(summary.realTotalTokens) + ' tokens</div>' +
-                        '</div>' +
-                        '<div class="hero-meta">' +
-                            '<div class="hero-meta-item">' +
-                                '<span class="hero-meta-label">总请求数</span>' +
-                                '<span class="hero-meta-value">' + summary.totalRequests + '</span>' +
-                            '</div>' +
-                            '<div class="hero-meta-item">' +
-                                '<span class="hero-meta-label">总成本</span>' +
-                                '<span class="hero-meta-value">' + formatCost(summary.totalCost) + '</span>' +
-                            '</div>' +
-                        '</div>' +
-                    '</div>' +
-                '</div>';
-            }
-
-            function renderStatsGrid(summary) {
-                return '<div class="stats-grid">' +
-                    '<div class="stat-card">' +
-                        '<div class="stat-card-label">新增输入</div>' +
-                        '<div class="stat-card-value">' + formatTokensWan(summary.totalInputTokens) + '</div>' +
-                    '</div>' +
-                    '<div class="stat-card">' +
-                        '<div class="stat-card-label">Output</div>' +
-                        '<div class="stat-card-value">' + formatTokensWan(summary.totalOutputTokens) + '</div>' +
-                    '</div>' +
-                    '<div class="stat-card">' +
-                        '<div class="stat-card-label">创建</div>' +
-                        '<div class="stat-card-value">' + summary.totalCacheCreationTokens + '</div>' +
-                    '</div>' +
-                    '<div class="stat-card">' +
-                        '<div class="stat-card-label">命中</div>' +
-                        '<div class="stat-card-value">' + formatTokensWan(summary.totalCacheReadTokens) + '</div>' +
-                    '</div>' +
-                '</div>';
-            }
-
-            function renderCacheHitRate(summary) {
-                return '<div class="progress-section">' +
-                    '<div class="progress-header">' +
-                        '<span class="progress-label">缓存命中率</span>' +
-                        '<span class="progress-value">' + formatPct(summary.cacheHitRate) + '</span>' +
-                    '</div>' +
-                    '<div class="progress-bar-bg">' +
-                        '<div class="progress-bar-fill" style="width:' + (summary.cacheHitRate * 100) + '%"></div>' +
-                    '</div>' +
-                '</div>';
-            }
-
-            function renderTrends(trends) {
-                if (!trends || trends.length === 0) {
-                    return '';
-                }
-                var html = '<div class="trend-table">' +
-                    '<div class="trend-table-header">' +
-                        '<div>日期</div>' +
-                        '<div>请求数</div>' +
-                        '<div>输入</div>' +
-                        '<div>输出</div>' +
-                        '<div>成本</div>' +
-                    '</div>';
-                for (var i = 0; i < trends.length; i++) {
-                    var t = trends[i];
-                    html += '<div class="trend-row">' +
-                        '<div>' + t.date + '</div>' +
-                        '<div>' + t.requestCount + '</div>' +
-                        '<div>' + formatTokensWan(t.inputTokens) + '</div>' +
-                        '<div>' + formatTokensWan(t.outputTokens) + '</div>' +
-                        '<div>' + formatCost(t.totalCost) + '</div>' +
-                    '</div>';
-                }
-                html += '</div>';
-                return html;
-            }
-
-            function render(data) {
-                var content = document.getElementById('content');
-
-                if (!data || !data.summary) {
-                    content.innerHTML = '<div class="empty">暂无数据</div>';
-                    document.getElementById('petSection').style.display = 'flex';
-                    computePetState(null);
-                    renderPet();
-                    return;
-                }
-
-                computePetState(data.summary);
-                renderPet();
-
-                var html = renderHero(data.summary) +
-                    renderStatsGrid(data.summary) +
-                    renderCacheHitRate(data.summary) +
-                    renderTrends(data.trends);
-
-                content.innerHTML = html;
-            }
-
-            function showLoading() {
-                document.getElementById('content').innerHTML = '<div class="loading">正在加载数据...</div>';
-            }
-
-            function showError(msg) {
-                document.getElementById('content').innerHTML = '<div class="error">加载失败: ' + msg + '</div>';
-            }
-
-            document.getElementById('presetSelect').addEventListener('change', function(e) {
-                vscode.postMessage({ command: 'changePreset', preset: e.target.value });
-                showLoading();
-            });
-
-            document.getElementById('refreshBtn').addEventListener('click', function() {
-                vscode.postMessage({ command: 'refresh' });
-                showLoading();
-            });
-
-            window.addEventListener('message', function(event) {
-                var msg = event.data;
-                console.log('[webview] received:', msg.command);
-                switch (msg.command) {
-                    case 'loading':
-                        showLoading();
-                        break;
-                    case 'setData':
-                        console.log('[webview] data:', JSON.stringify(msg.summary));
-                        render(msg);
-                        if (msg.preset) {
-                            document.getElementById('presetSelect').value = msg.preset;
-                        }
-                        break;
-                    case 'error':
-                        showError(msg.message);
-                        break;
-                }
-            });
-
-            // Always send ready
-            vscode.postMessage({ command: 'ready' });
-        })();
-    </script>
+    <script nonce="${nonce}" src="${scriptUri}"></script>
 </body>
 </html>`;
     }
 
-    public dispose() {
+    public dispose(): void {
         HistoryPanel.currentPanel = undefined;
-        this.panel.dispose();
-        for (const d of this.disposables) {
-            d.dispose();
+        this.refreshVersion++;
+        for (const disposable of this.disposables) {
+            disposable.dispose();
         }
+        this.panel.dispose();
     }
 }

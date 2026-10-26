@@ -48,6 +48,7 @@ export interface TokenMetrics {
     cachedTokens: number;
     totalTokens: number;
     contextLength: number;
+    model?: string;
 }
 
 export interface SpeedMetrics {
@@ -83,10 +84,16 @@ export interface CcSwitchProvider {
     category?: string;
     icon?: string;
     iconColor?: string;
-    meta?: Record<string, unknown>;
     isCurrent: boolean;
     costMultiplier: string;
     providerType?: string;
+}
+
+export interface SessionCost {
+    totalCost: number | null;
+    unpricedRequests: number;
+    pricedRequests: number;
+    multiplier: number;
 }
 
 export interface ClaudeState {
@@ -95,8 +102,11 @@ export interface ClaudeState {
     provider: CcSwitchProvider | null;
     tokenMetrics: TokenMetrics;
     speedMetrics: SpeedMetrics | null;
+    sessionCost: SessionCost;
     sessionDuration: string | null;
     gitInfo: GitInfo;
+    transcriptPath: string | null;
+    activityAt: number;
     updatedAt: number;
 }
 
